@@ -1,0 +1,113 @@
+# Model Bridge 配置文件
+# 将此文件复制到 ~/.model-bridge/config.yaml 并修改
+
+listen_port: 8080
+
+channels:
+  - id: "openai-primary"
+    name: "OpenAI 直连"
+    provider: openai
+    endpoint:
+      url: "https://api.openai.com/v1/chat/completions"
+    api_key: "sk-your-openai-key"
+    priority: 1
+    enabled: true
+    fallback_model: "gpt-4o-mini"
+    timeout_ms: 60000
+    model_mapping:
+      "gpt-4": "gpt-4o"
+      "gpt-4o": "gpt-4o"
+      "gpt-4o-mini": "gpt-4o-mini"
+      "gpt-3.5-turbo": "gpt-4o-mini"
+
+  # OpenAI Responses API 渠道
+  # - id: "openai-responses"
+  #   name: "OpenAI Responses"
+  #   provider: openai_responses
+  #   endpoint:
+  #     url: "https://api.openai.com/v1/responses"
+  #   api_key: "sk-your-openai-key"
+  #   priority: 2
+  #   enabled: true
+  #   fallback_model: "gpt-4o"
+
+  - id: "anthropic-main"
+    name: "Anthropic"
+    provider: anthropic
+    endpoint:
+      url: "https://api.anthropic.com/v1/messages"
+    api_key: "sk-ant-your-anthropic-key"
+    priority: 2
+    enabled: true
+    fallback_model: "claude-sonnet-4-6"
+    timeout_ms: 60000
+    model_mapping:
+      "gpt-4": "claude-opus-4-6"
+      "gpt-4o": "claude-sonnet-4-6"
+      "gpt-4o-mini": "claude-haiku-4"
+      "claude-opus": "claude-opus-4-6"
+      "claude-sonnet": "claude-sonnet-4-6"
+
+  - id: "deepseek-api"
+    name: "DeepSeek"
+    provider: openai
+    endpoint:
+      url: "https://api.deepseek.com/v1/chat/completions"
+    api_key: "sk-your-deepseek-key"
+    priority: 3
+    enabled: true
+    fallback_model: "deepseek-chat"
+    timeout_ms: 60000
+    model_mapping:
+      "gpt-4": "deepseek-chat"
+      "gpt-4o": "deepseek-chat"
+      "deepseek": "deepseek-chat"
+      "reasoning": "deepseek-reasoner"
+
+  - id: "qwen-dashscope"
+    name: "通义千问"
+    provider: openai
+    endpoint:
+      url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    api_key: "sk-your-qwen-key"
+    priority: 4
+    enabled: true
+    fallback_model: "qwen-turbo"
+    timeout_ms: 60000
+    model_mapping:
+      "gpt-4": "qwen-max"
+      "gpt-4o": "qwen-plus"
+      "gpt-4o-mini": "qwen-turbo"
+      "fast": "qwen-turbo"
+
+  - id: "ollama-local"
+    name: "本地 Ollama"
+    provider: openai
+    endpoint:
+      url: "http://localhost:11434/v1/chat/completions"
+    api_key: ""
+    priority: 99
+    enabled: false
+    fallback_model: "llama3"
+    timeout_ms: 120000
+    model_mapping:
+      "gpt-4": "llama3:70b"
+      "gpt-4o-mini": "llama3"
+      "code": "codellama"
+
+failover:
+  max_retries: 3
+  retry_timeout_ms: 5000
+  circuit_breaker:
+    failure_threshold: 3
+    recovery_interval_sec: 30
+    probe_requests: 2
+
+# 审计日志保留天数：0 = 永久留存（默认）。
+# 注意：无论保留天数如何，请求/响应详情（大字段）始终只保留最近 1000 条；
+# 列表与看板统计数据不受详情裁剪影响。
+# audit_retention_days: 0
+
+# 所有渠道全部失败后的最终兜底
+# ultimate_fallback:
+#   channel: "ollama-local"

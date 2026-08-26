@@ -1,0 +1,154 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===== 亮色主题（默认） ===== */
+:root {
+  --color-bg: #f5f7f9;
+  --color-bg-base: #ffffff;
+  --color-bg-card: #ffffff;
+  --color-bg-hover: #f0f4f8;
+  --color-bg-elevated: #fbfcfd;
+  --color-border: #d9e0e7;
+  --color-text: #182230;
+  --color-text-sec: #526172;
+  --color-text-muted: #8793a1;
+  --color-accent: #1769aa;
+  --color-accent-dim: #12578f;
+  --color-accent-glow: rgba(23, 105, 170, 0.12);
+  --color-danger: #ef4444;
+  --glass-blur: none;
+  --shadow-card: 0 1px 2px rgba(24, 34, 48, 0.04);
+  --shadow-glow: 0 2px 8px rgba(23, 105, 170, 0.08);
+}
+
+/* ===== 暗色主题 ===== */
+html.dark {
+  --color-bg: #111820;
+  --color-bg-base: #17212b;
+  --color-bg-card: #1b2732;
+  --color-bg-hover: #243341;
+  --color-bg-elevated: #202e3a;
+  --color-border: #344555;
+  --color-text: #f1f5f9;
+  --color-text-sec: #b7c3cf;
+  --color-text-muted: #81909e;
+  --color-accent: #64a6d8;
+  --color-accent-dim: #4182b6;
+  --color-accent-glow: rgba(100, 166, 216, 0.18);
+  --color-danger: #f87171;
+  --glass-blur: blur(24px);
+  --shadow-card: 0 4px 24px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --shadow-glow: 0 0 30px rgba(34, 211, 238, 0.15);
+}
+
+/* ===== 全局基础 ===== */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  transition: scrollbar-color 0.3s;
+}
+*:hover {
+  scrollbar-color: var(--color-border) transparent;
+}
+*::-webkit-scrollbar { width: 6px; height: 6px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: transparent; border-radius: 3px; transition: background 0.3s; }
+*:hover::-webkit-scrollbar-thumb { background: var(--color-border); }
+
+html { background: var(--color-bg); }
+
+body {
+  margin: 0;
+  font-family: theme('fontFamily.body');
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--color-text);
+  background: var(--color-bg);
+  min-height: 100vh;
+  transition: background-color 0.3s, color 0.3s;
+}
+
+html.dark body {
+  background: var(--color-bg);
+}
+
+/* ===== 组件样式 ===== */
+@layer components {
+  .input {
+    @apply w-full px-3 py-2 text-sm rounded-lg focus:outline-none transition-all duration-200;
+    background: var(--color-bg-elevated);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
+  }
+  .input::placeholder { color: var(--color-text-muted); }
+  .input:focus {
+    border-color: var(--color-accent-dim);
+    box-shadow: 0 0 0 2px var(--color-accent-glow);
+  }
+  .input:disabled { @apply cursor-not-allowed; opacity: 0.5; }
+
+  .glass-card {
+    background: var(--color-bg-card);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    box-shadow: var(--shadow-card);
+    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .glass-card:hover {
+    border-color: var(--color-border);
+    box-shadow: var(--shadow-card);
+  }
+
+  .btn-primary {
+    @apply px-4 py-2 text-sm font-medium rounded-lg transition-all duration-200;
+    background: var(--color-accent-dim);
+    color: #fff;
+  }
+  html.dark .btn-primary { color: #0f172a; }
+  .btn-primary:hover { background: var(--color-accent); box-shadow: var(--shadow-glow); }
+  .btn-primary:disabled { opacity: 0.5; transform: none; box-shadow: none; }
+
+  .btn-ghost {
+    @apply px-3 py-2 text-sm rounded-lg transition-all duration-200;
+    color: var(--color-text-sec);
+    background: transparent;
+    border: 1px solid var(--color-border);
+  }
+  .btn-ghost:hover {
+    background: var(--color-bg-hover);
+    color: var(--color-text);
+    border-color: var(--color-border);
+  }
+
+  .btn-danger {
+    @apply px-3 py-2 text-sm rounded-lg transition-all duration-200;
+    color: var(--color-danger);
+    background: rgba(220, 38, 38, 0.08);
+    border: 1px solid rgba(220, 38, 38, 0.15);
+  }
+  html.dark .btn-danger {
+    background: rgba(248, 113, 113, 0.1);
+    border-color: rgba(248, 113, 113, 0.2);
+  }
+  .btn-danger:hover { opacity: 0.85; }
+
+}
+
+/* Practical SaaS surfaces used by the redesigned pages. */
+.page-surface {
+  background: var(--color-bg-base);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-card);
+}
+
+.section-label {
+  color: var(--color-text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}

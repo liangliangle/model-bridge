@@ -1,0 +1,12 @@
+node_modules/
+dist/
+release/
+src-tauri/target/
+.DS_Store
+**/.DS_Store
+*.log
+.model-bridge.pid
+.qwen/
+.build/
+macos-client/.build/
+macos-client/dist/
