@@ -64,7 +64,7 @@
 
 #### 前置依赖
 
-- [Rust](https://rustup.rs/) (1.75+)
+- [Go](https://go.dev/dl/) (1.23+)
 - [Node.js](https://nodejs.org/) (18+)
 - [pnpm](https://pnpm.io/) (`npm install -g pnpm`)
 
@@ -91,14 +91,15 @@ pnpm install
 # 2. 构建前端（输出到 dist/）
 pnpm build
 
-# 3. 编译后端（会将 dist/ 嵌入二进制）
-cd src-tauri
-cargo build --release
+# 3. 编译后端（会把 dist/ 同步进 go/internal/web/dist 后嵌入二进制）
+cd go
+./build.sh
 
-# 产物位于 src-tauri/target/release/model-bridge
+# 产物位于 go/bin/model-bridge
 ```
 
-> 必须先 `pnpm build` 再 `cargo build`，因为 Rust 编译时会把 `dist/` 以 `include_bytes!` 嵌入二进制。
+> 必须先 `pnpm build`：Go 用 `//go:embed` 内嵌前端，而 `go:embed` 不能引用模块目录之外的文件，
+> 所以 `go/build.sh` 会先把仓库根的 `dist/` 复制进 `go/internal/web/dist/` 再编译。
 
 #### 开发模式
 
@@ -111,8 +112,15 @@ pnpm dev
 后端单独运行（使用已编译的前端）：
 
 ```bash
-cd src-tauri
-cargo run
+cd go
+go build -p 1 -o bin/model-bridge ./cmd/model-bridge
+./bin/model-bridge
+```
+
+或者用根目录的脚本一条命令完成「停止旧进程 → 编译 → 后台启动」：
+
+```bash
+./restart.sh
 ```
 
 ## 配置

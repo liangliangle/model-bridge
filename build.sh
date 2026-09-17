@@ -1,8 +1,8 @@
 #!/bin/bash
 # 构建 Go 后端并把产物打包到 release/。
 #
-# 与 Rust 版的差别：编译 Go 而不是 cargo，并把内嵌前端从仓库根的 dist/
-# 同步进 go/internal/web/dist/（//go:embed 不能引用模块目录之外的文件）。
+# 把内嵌前端从仓库根的 dist/ 同步进 go/internal/web/dist/
+# （//go:embed 不能引用模块目录之外的文件），再编译 Go 后端。
 #
 # 用法：
 #   ./build.sh                 # 构建前端 + 后端

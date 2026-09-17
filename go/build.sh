@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 构建 Go 后端。
 #
-# 与 Rust 侧「先 pnpm build 再 cargo build」的既有约定一致：前端产物必须先落到
-# go/internal/web/dist，因为 //go:embed 无法引用模块目录之外的文件（见规划 Deviations）。
+# 前端产物必须先落到 go/internal/web/dist，因为 //go:embed 无法引用模块目录之外
+# 的文件（见规划 Deviations）。
 #
 # 用法：
 #   ./build.sh                 # 复用仓库根目录已有的 dist/，直接编译

@@ -652,14 +652,16 @@ func TestResponsesBuiltinTools(t *testing.T) {
 	}
 }
 
-// TestCodexFixtureToolAccounting 用仓库里固定的 Codex Responses 夹具核对工具口径，
-// 与 Rust 集成测试 test_real_codex_request_preserves_tools（tests/test_responses_flow.rs
-// line 1425）同源：所有声明的工具都必须到达出站体，且反向映射条目数 =
+// TestCodexFixtureToolAccounting 用仓库里固定的 Codex Responses 夹具核对工具口径：
+// 所有声明的工具都必须到达出站体，且反向映射条目数 =
 // namespace 子工具数 + custom 工具数。
+//
+// 夹具原本放在 Rust 侧的 tests/fixtures/ 下，删除 Rust 代码时搬到了本包的 testdata/。
+// 失配即为硬失败（不再 Skip），避免夹具丢失后测试被静默跳过、覆盖度无声下降。
 func TestCodexFixtureToolAccounting(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "src-tauri", "tests", "fixtures", "codex_responses_request.json"))
+	raw, err := os.ReadFile(filepath.Join("testdata", "codex_responses_request.json"))
 	if err != nil {
-		t.Skipf("夹具不可用：%v", err)
+		t.Fatalf("夹具不可用：%v", err)
 	}
 	req, err := decodeObject(raw)
 	if err != nil {

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "build:all": "vite build && cd src-tauri && cargo build --release",
+    "build:all": "vite build && cd go && BUILD_FRONTEND=0 ./build.sh",
     "preview": "vite preview"
   },
   "dependencies": {
