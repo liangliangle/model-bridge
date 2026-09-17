@@ -47,8 +47,7 @@ const GET_ENDPOINTS: Record<string, string> = {
   get_channel_health: "/channels/health", // 获取渠道健康状态
   get_full_config: "/config",          // 获取完整配置（含渠道详情和 API Key）
   get_mcp_oauth_status: "/config/mcp/oauth/status", // 查询 MCP server OAuth 授权状态
-  get_skills: "/skills",                    // 扫描汇总所有 skill
-  get_skill_content: "/skills/content",     // 读单个 SKILL.md
+  get_model_prices: "/model-prices",   // 获取模型价格列表
 };
 
 /** POST 请求的命令 → 端点映射 */
@@ -63,13 +62,8 @@ const POST_ENDPOINTS: Record<string, string> = {
   start_mcp_oauth: "/config/mcp/oauth/start", // 触发 MCP server OAuth 授权
   fetch_mcp_tools: "/config/mcp/tools/fetch", // 主动拉取上游工具列表
   toggle_mcp_tool: "/config/mcp/tools/toggle", // 启用/禁用单个工具
-  save_skill_content: "/skills/content",    // 写 SKILL.md
-  toggle_skill: "/skills/toggle",           // 启用/禁用 skill 对某 agent
-  distribute_skill: "/skills/distribute",   // 批量分发到多 agent
-  import_skill: "/skills/import",           // 纳入中心库管理
-  save_skill_agent: "/config/skill/agent",  // 增改扫描目标
-  delete_skill_agent: "/config/skill/agent/delete", // 删扫描目标
-  save_skill_central: "/config/skill/central", // 改中心库路径
+  save_model_price: "/model-prices",       // 保存/新建模型价格
+  delete_model_price: "/model-prices/delete", // 删除模型价格
   force_cleanup_audit: "/audit/cleanup",       // 强制清理审计数据并回收磁盘空间
 };
 

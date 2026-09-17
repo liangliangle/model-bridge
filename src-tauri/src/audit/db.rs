@@ -80,6 +80,7 @@ impl AuditDb {
                 output_tokens           INTEGER,
                 cache_read_tokens       INTEGER,
                 cache_creation_tokens   INTEGER,
+                cost_usd                REAL,
                 retry_count             INTEGER DEFAULT 0,
                 failover_chain          TEXT,
                 error_message           TEXT,
@@ -126,6 +127,7 @@ impl AuditDb {
                 "cache_read_tokens INTEGER",
                 "cache_creation_tokens INTEGER",
                 "first_byte_ms INTEGER",
+                "cost_usd REAL",
             ] {
                 conn.execute_batch(&format!("ALTER TABLE audit_log ADD COLUMN {};", col)).ok();
             }
@@ -135,6 +137,7 @@ impl AuditDb {
                 "cache_read_tokens INTEGER",
                 "cache_creation_tokens INTEGER",
                 "first_byte_ms INTEGER",
+                "cost_usd REAL",
             ] {
                 conn.execute_batch(&format!("ALTER TABLE audit_log ADD COLUMN {};", col)).ok();
             }
@@ -283,6 +286,7 @@ impl AuditDb {
                     output_tokens           INTEGER,
                     cache_read_tokens       INTEGER,
                     cache_creation_tokens   INTEGER,
+                    cost_usd                REAL,
                     retry_count             INTEGER DEFAULT 0,
                     failover_chain          TEXT,
                     error_message           TEXT,
@@ -296,11 +300,11 @@ impl AuditDb {
                  (id, timestamp, method, path, alias_model, actual_channel, actual_model,
                   mapping_source, status_code, first_byte_ms, latency_ms,
                   input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-                  retry_count, failover_chain, error_message, user_agent)
+                  cost_usd, retry_count, failover_chain, error_message, user_agent)
                  SELECT id, timestamp, method, path, alias_model, actual_channel, actual_model,
                   mapping_source, status_code, first_byte_ms, latency_ms,
                   input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-                  retry_count, failover_chain, error_message, user_agent
+                  cost_usd, retry_count, failover_chain, error_message, user_agent
                  FROM audit_log_old",
                 [],
             ).map_err(|e| format!("Copy main table data: {}", e))?;
@@ -446,16 +450,17 @@ impl AuditDb {
     pub fn update_response(&self, id: i64, status_code: u16, latency_ms: u64,
                            upstream_headers: Option<&str>, upstream_body: Option<&str>,
                            response_headers: Option<&str>, response_body: Option<&str>,
-                           tokens: &TokenUsage) -> Result<(), String> {
+                           tokens: &TokenUsage, cost_usd: Option<f64>) -> Result<(), String> {
         let conn = self.conn.lock();
         // 主表：数值 + 状态
         conn.execute(
             "UPDATE audit_log SET status_code=?2, first_byte_ms=?3, latency_ms=?3,
              input_tokens=?4, output_tokens=?5,
-             cache_read_tokens=?6, cache_creation_tokens=?7 WHERE id=?1",
+             cache_read_tokens=?6, cache_creation_tokens=?7, cost_usd=?8 WHERE id=?1",
             params![id, status_code as i64, latency_ms as i64,
                     tokens.input.map(|t| t as i64), tokens.output.map(|t| t as i64),
-                    tokens.cache_read.map(|t| t as i64), tokens.cache_creation.map(|t| t as i64)],
+                    tokens.cache_read.map(|t| t as i64), tokens.cache_creation.map(|t| t as i64),
+                    cost_usd],
         ).map_err(|e| format!("update_response failed: {}", e))?;
         // 副表：响应头 + 响应体
         conn.execute(
@@ -470,7 +475,7 @@ impl AuditDb {
     /// raw_stream 为上游原始流；forwarded_stream 为转换后下发给客户端的流（透传场景传 None）。
     /// upstream_status 为上游真实 HTTP 状态码（>= 400 时优先采信，避免内容检测漏判）。
     /// upstream_response_body 记录上游原始（组装）；response_body 记录客户端实际收到的内容。
-    pub fn update_streaming_response(&self, id: i64, raw_stream: &str, forwarded_stream: Option<&str>, upstream_status: Option<u16>, total_latency_ms: u64) -> Result<(), String> {
+    pub fn update_streaming_response(&self, id: i64, raw_stream: &str, forwarded_stream: Option<&str>, upstream_status: Option<u16>, total_latency_ms: u64, cost_usd: Option<f64>) -> Result<(), String> {
         let upstream_assembled = assemble_streaming_response(raw_stream);
         // 转发响应也组装为最终结果对象（Responses/Chat/Anthropic 均支持），
         // 展示拼合后的完整响应而非逐条 SSE 事件；透传场景沿用上游组装结果。
@@ -493,11 +498,13 @@ impl AuditDb {
              status_code=COALESCE(?2, status_code, 200), error_message=COALESCE(?3, error_message),
              input_tokens=COALESCE(?4, input_tokens), output_tokens=COALESCE(?5, output_tokens),
              cache_read_tokens=COALESCE(?6, cache_read_tokens), cache_creation_tokens=COALESCE(?7, cache_creation_tokens),
-             latency_ms=?8
+             cost_usd=COALESCE(?8, cost_usd),
+             latency_ms=?9
              WHERE id=?1",
             params![id, final_status, error_msg,
                     tokens.input.map(|t| t as i64), tokens.output.map(|t| t as i64),
                     tokens.cache_read.map(|t| t as i64), tokens.cache_creation.map(|t| t as i64),
+                    cost_usd,
                     total_latency_ms as i64],
         ).map_err(|e| format!("update_streaming_response failed: {}", e))?;
         // 副表：响应体
@@ -549,7 +556,7 @@ impl AuditDb {
 
         let select = "SELECT id, timestamp, method, path, alias_model, actual_channel, actual_model,
              mapping_source, status_code, first_byte_ms, latency_ms, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, retry_count, failover_chain, error_message FROM audit_log";
+             cache_read_tokens, cache_creation_tokens, cost_usd, retry_count, failover_chain, error_message FROM audit_log";
 
         // 动态构建 WHERE 条件
         let mut conditions: Vec<String> = Vec::new();
@@ -632,9 +639,10 @@ impl AuditDb {
                 output_tokens: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
                 cache_read_tokens: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
                 cache_creation_tokens: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
-                retry_count: row.get::<_, i64>(15)? as u32,
-                failover_chain: row.get(16)?,
-                error_message: row.get(17)?,
+                cost_usd: row.get(15)?,
+                retry_count: row.get::<_, i64>(16)? as u32,
+                failover_chain: row.get(17)?,
+                error_message: row.get(18)?,
             })
         })
         .map_err(|e| format!("Query failed: {}", e))?
@@ -652,7 +660,7 @@ impl AuditDb {
             a.id, a.timestamp, a.method, a.path, a.alias_model, a.actual_channel, a.actual_model,
             a.mapping_source, a.status_code, a.first_byte_ms, a.latency_ms,
             a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens,
-            a.retry_count, a.failover_chain, a.error_message, a.user_agent,
+            a.cost_usd, a.retry_count, a.failover_chain, a.error_message, a.user_agent,
             b.request_headers, b.forwarded_request_headers, b.request_body, b.forwarded_request_body,
             b.upstream_response_headers, b.response_headers, b.upstream_response_body, b.response_body
             FROM audit_log a
@@ -668,18 +676,18 @@ impl AuditDb {
                 timestamp: row.get(1)?,
                 method: row.get(2)?,
                 path: row.get(3)?,
-                request_headers: row.get(19)?,
-                forwarded_request_headers: row.get(20)?,
-                request_body: row.get(21)?,
-                forwarded_request_body: row.get(22)?,
+                request_headers: row.get(20)?,
+                forwarded_request_headers: row.get(21)?,
+                request_body: row.get(22)?,
+                forwarded_request_body: row.get(23)?,
                 alias_model: row.get(4)?,
                 actual_channel: row.get(5)?,
                 actual_model: row.get(6)?,
                 mapping_source: row.get(7)?,
-                upstream_response_headers: row.get(23)?,
-                response_headers: row.get(24)?,
-                upstream_response_body: row.get(25)?,
-                response_body: row.get(26)?,
+                upstream_response_headers: row.get(24)?,
+                response_headers: row.get(25)?,
+                upstream_response_body: row.get(26)?,
+                response_body: row.get(27)?,
                 status_code: row.get::<_, Option<i64>>(8)?.map(|v| v as u16),
                 first_byte_ms: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
                 latency_ms: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
@@ -687,10 +695,11 @@ impl AuditDb {
                 output_tokens: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
                 cache_read_tokens: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
                 cache_creation_tokens: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
-                retry_count: row.get::<_, i64>(15)? as u32,
-                failover_chain: row.get(16)?,
-                error_message: row.get(17)?,
-                user_agent: row.get(18)?,
+                cost_usd: row.get(15)?,
+                retry_count: row.get::<_, i64>(16)? as u32,
+                failover_chain: row.get(17)?,
+                error_message: row.get(18)?,
+                user_agent: row.get(19)?,
             })
         });
 
@@ -736,7 +745,8 @@ impl AuditDb {
                 COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0),
                 COALESCE(SUM(COALESCE(cache_creation_tokens, 0)), 0),
                 COALESCE(SUM(CASE WHEN status_code IS NOT NULL AND (status_code >= 400 OR error_message IS NOT NULL) THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN status_code IS NOT NULL AND status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END), 0)
+                COALESCE(SUM(CASE WHEN status_code IS NOT NULL AND status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(COALESCE(cost_usd, 0)), 0)
              FROM audit_log WHERE {}", conditions.join(" AND ")
         );
 
@@ -754,6 +764,7 @@ impl AuditDb {
                 cache_creation_tokens: row.get::<_, i64>(4)? as u64,
                 error_count: row.get::<_, i64>(5)? as u64,
                 success_count: row.get::<_, i64>(6)? as u64,
+                cost_usd: row.get::<_, f64>(7)?,
             })
         }).map_err(|e| format!("Stats parse failed: {}", e))?;
 
@@ -923,7 +934,8 @@ impl AuditDb {
                 COALESCE(SUM(COALESCE(output_tokens, 0)), 0),
                 COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0),
                 COALESCE(SUM(COALESCE(cache_creation_tokens, 0)), 0),
-                COUNT(CASE WHEN status_code IS NOT NULL THEN 1 END) as finished
+                COUNT(CASE WHEN status_code IS NOT NULL THEN 1 END) as finished,
+                COALESCE(SUM(COALESCE(cost_usd, 0)), 0)
              FROM audit_log
              WHERE actual_channel = ?1
                AND timestamp >= ?2"
@@ -949,6 +961,7 @@ impl AuditDb {
                     output_tokens: row.get::<_, i64>(6)? as u64,
                     cache_read_tokens: row.get::<_, i64>(7)? as u64,
                     cache_creation_tokens: row.get::<_, i64>(8)? as u64,
+                    cost_usd: row.get::<_, f64>(10)?,
                 })
             },
         ).map_err(|e| format!("Channel stats parse failed: {}", e))?;
@@ -973,6 +986,7 @@ pub struct ChannelDbStats {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    pub cost_usd: f64,
 }
 
 /// 审计列表项（轻量，不含报文内容）
@@ -996,6 +1010,7 @@ pub struct AuditListItem {
     pub retry_count: u32,
     pub failover_chain: Option<String>,
     pub error_message: Option<String>,
+    pub cost_usd: Option<f64>,
 }
 
 /// 审计统计概要
@@ -1008,6 +1023,7 @@ pub struct AuditStats {
     pub cache_creation_tokens: u64,
     pub error_count: u64,
     pub success_count: u64,
+    pub cost_usd: f64,
 }
 
 /// 强制清理的结果（供设置页展示）
@@ -1089,7 +1105,7 @@ pub fn extract_tokens_from_json(body: &serde_json::Value) -> TokenUsage {
 /// 从 SSE 流式响应中提取 token 用量
 /// 扫描所有 data 行，找到包含 usage 的最后一条（通常在 message_delta 或最终 chunk 中）
 /// 兼容三种格式：Anthropic SSE、OpenAI Chat SSE、OpenAI Responses SSE
-fn extract_tokens_from_stream(raw_stream: &str) -> TokenUsage {
+pub fn extract_tokens_from_stream(raw_stream: &str) -> TokenUsage {
     let mut tokens = TokenUsage::default();
 
     for line in raw_stream.lines() {
@@ -1552,7 +1568,7 @@ mod split_body_tests {
         db.update_response(id, 200, 150,
             Some("{\"upstream-h\":\"v\"}"), Some("{\"upstream\":\"body\"}"),
             Some("{\"resp-h\":\"v\"}"), Some("{\"resp\":\"body\"}"),
-            &tokens).unwrap();
+            &tokens, Some(0.0005)).unwrap();
 
         // 验证迁移前 get_by_id 能读到大字段
         let before = db.get_by_id(id).unwrap().unwrap();
@@ -1633,7 +1649,7 @@ mod split_body_tests {
             let id = db.create("POST", &format!("/v1/{}", i), "gpt-4",
                 Some("big-headers"), Some("big-body"), None).unwrap();
             let tokens = TokenUsage { input: Some(10), output: Some(5), cache_read: None, cache_creation: None };
-            db.update_response(id, 200, 100, None, None, None, None, &tokens).unwrap();
+            db.update_response(id, 200, 100, None, None, None, None, &tokens, Some(0.0001)).unwrap();
         }
 
         // query_list 应正常工作，只返回小字段

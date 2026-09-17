@@ -11,9 +11,9 @@
 pub mod audit;
 pub mod channel;
 pub mod converter;
+pub mod cost;
 pub mod commands;
 pub mod mcp;
 pub mod provider;
 pub mod proxy;
-pub mod skill;
 pub mod static_files;

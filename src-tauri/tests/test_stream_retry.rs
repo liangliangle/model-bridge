@@ -127,7 +127,7 @@ fn make_test_config(channels: Vec<ChannelConfig>) -> AppConfig {
         ultimate_fallback: None,
         auth: AuthConfig::default(),
         mcp_servers: vec![],
-        skill_manager: SkillManagerConfig::default(),
+        model_prices: vec![],
         audit_retention_days: None,
     }
 }

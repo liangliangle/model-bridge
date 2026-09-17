@@ -70,15 +70,9 @@ pub async fn start_server(state: Arc<AppState>, shutdown_rx: oneshot::Receiver<(
         .route("/api/config/mcp/oauth/status", get(crate::commands::get_mcp_oauth_status))
         .route("/api/config/mcp/tools/fetch", post(crate::commands::fetch_mcp_tools))
         .route("/api/config/mcp/tools/toggle", post(crate::commands::toggle_mcp_tool))
-        // Skill 统一管理
-        .route("/api/skills", get(crate::skill::get_skills))
-        .route("/api/skills/content", get(crate::skill::get_skill_content).post(crate::skill::save_skill_content))
-        .route("/api/skills/toggle", post(crate::skill::toggle_skill))
-        .route("/api/skills/distribute", post(crate::skill::distribute_skill))
-        .route("/api/skills/import", post(crate::skill::import_skill))
-        .route("/api/config/skill/central", post(crate::skill::save_skill_central))
-        .route("/api/config/skill/agent", post(crate::skill::save_skill_agent))
-        .route("/api/config/skill/agent/delete", post(crate::skill::delete_skill_agent))
+        // 模型价格管理
+        .route("/api/model-prices", get(crate::commands::get_model_prices).post(crate::commands::save_model_price))
+        .route("/api/model-prices/delete", post(crate::commands::delete_model_price))
         .fallback(crate::static_files::static_handler)
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024)) // 64MB — allow large conversation payloads
         .layer(axum::middleware::from_fn(log_oversized_body))

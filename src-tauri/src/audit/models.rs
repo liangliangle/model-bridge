@@ -26,6 +26,7 @@ pub struct AuditEntry {
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub cache_creation_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
     pub retry_count: u32,
     pub failover_chain: Option<String>,
     pub error_message: Option<String>,

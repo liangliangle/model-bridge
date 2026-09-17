@@ -142,6 +142,7 @@ async fn filter_tools_list(
         Some(r#"{"content-type":"application/json"}"#),
         Some(&out_body),
         &TokenUsage::default(),
+        None,
     );
 
     let builder = Response::builder()
@@ -186,6 +187,7 @@ async fn passthrough_json(
         None,
         Some(&text),
         &TokenUsage::default(),
+        None,
     );
 
     let builder = Response::builder()
@@ -255,7 +257,7 @@ pub async fn passthrough_sse(
         let total_latency = stream_start.elapsed().as_millis() as u64;
         let raw_bytes = collected_for_audit.lock().clone();
         let text = String::from_utf8_lossy(&raw_bytes).to_string();
-        let _ = audit_db.update_streaming_response(audit_id, &text, None, Some(upstream_status_for_audit), total_latency);
+        let _ = audit_db.update_streaming_response(audit_id, &text, None, Some(upstream_status_for_audit), total_latency, None);
     });
 
     let builder = Response::builder()
@@ -309,6 +311,7 @@ pub async fn forward_get(
             audit_id, status, latency,
             Some(&headers_json(&upstream_headers)), None, None, None,
             &TokenUsage::default(),
+            None,
         );
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
@@ -357,6 +360,7 @@ pub async fn forward_delete(
         audit_id, status, latency,
         Some(&headers_json(&upstream_headers)), Some(&text), None, Some(&text),
         &TokenUsage::default(),
+        None,
     );
 
     let builder = Response::builder()
