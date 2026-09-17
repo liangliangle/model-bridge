@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-use crate::channel::config::{AppConfig, AuthConfig, ChannelConfig, EndpointConfig, McpServerConfig, ProviderType, UltimateFallback};
+use crate::channel::config::{AppConfig, AuthConfig, ChannelConfig, EndpointConfig, McpServerConfig, ModelPrice, ProviderType, UltimateFallback, default_true};
 use crate::channel::health::ChannelHealth;
 use crate::proxy::server::{check_admin_auth, AppState};
 
@@ -75,7 +75,9 @@ fn default_retry_delay_edit() -> u64 { 500 }
 /// 故障转移配置的编辑数据
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FailoverEditData {
-    pub max_retries: u32,
+    /// 候选渠道数上限；`0` = 不限制。兼容旧字段名 `max_retries`（旧前端仍可能提交）。
+    #[serde(alias = "max_retries")]
+    pub max_failover_channels: u32,
     pub retry_timeout_ms: u64,
     pub failure_threshold: u32,
     pub recovery_interval_sec: u64,
@@ -357,7 +359,7 @@ pub async fn get_full_config(
             auto_cache: c.auto_cache,
         }).collect(),
         failover: FailoverEditData {
-            max_retries: config.failover.max_retries,
+            max_failover_channels: config.failover.max_failover_channels,
             retry_timeout_ms: config.failover.retry_timeout_ms,
             failure_threshold: config.failover.circuit_breaker.failure_threshold,
             recovery_interval_sec: config.failover.circuit_breaker.recovery_interval_sec,
@@ -657,7 +659,7 @@ pub async fn save_failover_config(
     if let Some(reject) = check_admin_auth(&state, &headers) { return reject; }
     {
         let mut config = state.config.write();
-        config.failover.max_retries = failover.max_retries;
+        config.failover.max_failover_channels = failover.max_failover_channels;
         config.failover.retry_timeout_ms = failover.retry_timeout_ms;
         config.failover.circuit_breaker.failure_threshold = failover.failure_threshold;
         config.failover.circuit_breaker.recovery_interval_sec = failover.recovery_interval_sec;
@@ -817,6 +819,88 @@ pub async fn test_channel(
                 "latency_ms": latency_ms,
             })).into_response()
         }
+    }
+}
+
+// ========== 模型价格管理 ==========
+
+/// 列出所有模型定价
+pub async fn get_model_prices(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(reject) = check_admin_auth(&state, &headers) { return reject; }
+    let prices = state.config.read().model_prices.clone();
+    Json(json!(prices)).into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ModelPriceReq {
+    pub model: String,
+    #[serde(default)]
+    pub input_per_mtok: f64,
+    #[serde(default)]
+    pub output_per_mtok: f64,
+    #[serde(default)]
+    pub cache_read_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub cache_write_per_mtok: Option<f64>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// 保存（新增或更新）单个模型定价
+pub async fn save_model_price(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ModelPriceReq>,
+) -> Response {
+    if let Some(reject) = check_admin_auth(&state, &headers) { return reject; }
+    if req.model.trim().is_empty() {
+        return Json(json!({"error": "模型名不能为空"})).into_response();
+    }
+    let price = ModelPrice {
+        model: req.model.trim().to_string(),
+        input_per_mtok: req.input_per_mtok,
+        output_per_mtok: req.output_per_mtok,
+        cache_read_per_mtok: req.cache_read_per_mtok,
+        cache_write_per_mtok: req.cache_write_per_mtok,
+        enabled: req.enabled,
+    };
+    {
+        let mut config = state.config.write();
+        if let Some(existing) = config.model_prices.iter_mut().find(|p| p.model == price.model) {
+            *existing = price;
+        } else {
+            config.model_prices.push(price);
+        }
+    }
+    match save_config_to_disk(&state.config.read()) {
+        Ok(_) => Json(json!({"success": true})).into_response(),
+        Err(e) => Json(json!({"error": e})).into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteModelPriceReq {
+    pub model: String,
+}
+
+/// 删除单个模型定价
+pub async fn delete_model_price(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteModelPriceReq>,
+) -> Response {
+    if let Some(reject) = check_admin_auth(&state, &headers) { return reject; }
+    {
+        let mut config = state.config.write();
+        config.model_prices.retain(|p| p.model != req.model);
+    }
+    match save_config_to_disk(&state.config.read()) {
+        Ok(_) => Json(json!({"success": true})).into_response(),
+        Err(e) => Json(json!({"error": e})).into_response(),
     }
 }
 

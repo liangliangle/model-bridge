@@ -973,6 +973,10 @@ fn test_stream_chat_tool_calls_to_responses() {
     all.extend(conv.process_chunk(b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\" \\\"SF\\\"}\"}}]},\"finish_reason\":null}]}\n\n"));
     // 结束
     all.extend(conv.process_chunk(b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"));
+    // 流结束符：收尾事件（function_call_arguments.done / response.completed）在
+    // finish_reason 之后才发出——上游 usage chunk 位于 finish_reason 与 [DONE]
+    // 之间，必须等它到达才能带上 usage。生产路径另由 executor 的 finalize() 兜底。
+    all.extend(conv.process_chunk(b"data: [DONE]\n\n"));
 
     let text = collect_text(&all);
     println!("Chat tool_calls → Responses:\n{}", text);
@@ -1413,18 +1417,19 @@ fn test_cross_request_isolation() {
     );
 }
 
+/// 真实形态的 Codex Responses 请求（含 namespace / custom / web_search 工具）
+/// 经 Responses → Anthropic 转换后，所有声明的工具都必须保留。
+///
+/// 夹具为仓库内固定文件。此前该测试读取的是调试时遗留在 `/tmp/audit4149.json`
+/// 的审计导出，在任何没有该文件的机器上都会失败，因此不具备可复现性。
 #[test]
 fn test_real_codex_request_preserves_tools() {
-    let raw = std::fs::read_to_string("/tmp/audit4149.json").expect("audit file must exist");
-    let audit: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    let body = audit
-        .get("request_body")
-        .expect("must have request_body");
-    let body: serde_json::Value = if body.is_string() {
-        serde_json::from_str(body.as_str().unwrap()).unwrap()
-    } else {
-        body.clone()
-    };
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex_responses_request.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
+    let body: serde_json::Value =
+        serde_json::from_str(&raw).expect("fixture must be valid JSON");
 
     let fc =
         FormatConverter::from_formats(InputFormat::Responses, &ProviderType::Anthropic).unwrap();

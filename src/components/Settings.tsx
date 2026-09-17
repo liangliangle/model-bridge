@@ -6,7 +6,7 @@ interface FullConfig {
   listen_host: string;
   public_url: string | null;
   models: string[];
-  failover: { max_retries: number; retry_timeout_ms: number; failure_threshold: number; recovery_interval_sec: number; probe_requests: number };
+  failover: { max_failover_channels: number; retry_timeout_ms: number; failure_threshold: number; recovery_interval_sec: number; probe_requests: number };
   auth: { proxy_tokens: string[]; admin_token: string | null };
   ultimate_fallback_channel: string | null;
   channels: { id: string; name: string }[];
@@ -40,7 +40,7 @@ export default function Settings() {
   const [host, setHost] = useState("127.0.0.1");
   const [publicUrl, setPublicUrl] = useState("");
   const [models, setModels] = useState("");
-  const [failover, setFailover] = useState({ max_retries: 3, retry_timeout_ms: 5000, failure_threshold: 3, recovery_interval_sec: 30, probe_requests: 2 });
+  const [failover, setFailover] = useState({ max_failover_channels: 3, retry_timeout_ms: 5000, failure_threshold: 3, recovery_interval_sec: 30, probe_requests: 2 });
   const [proxyTokens, setProxyTokens] = useState("");
   const [adminToken, setAdminToken] = useState("");
   const [ultimateFallback, setUltimateFallback] = useState("");
@@ -169,9 +169,9 @@ export default function Settings() {
 
         <Section title="故障转移" description="控制渠道故障时的切换策略">
           <div className="grid grid-cols-2 gap-4">
-            <FormField label="最大重试次数">
-              <input className="input" type="number" value={failover.max_retries} onChange={(e) => setFailover({ ...failover, max_retries: Number(e.target.value) })} min={1} max={10} />
-              <p className="text-[10px] text-th-text-m mt-1">单次请求最多尝试几个渠道</p>
+            <FormField label="候选渠道上限">
+              <input className="input" type="number" value={failover.max_failover_channels} onChange={(e) => setFailover({ ...failover, max_failover_channels: Number(e.target.value) })} min={0} max={50} />
+              <p className="text-[10px] text-th-text-m mt-1">单次请求最多尝试几个渠道；0 表示不限制。单渠道内的重试次数请在各渠道配置中单独设置</p>
             </FormField>
             <FormField label="重试超时 (ms)">
               <input className="input" type="number" value={failover.retry_timeout_ms} onChange={(e) => setFailover({ ...failover, retry_timeout_ms: Number(e.target.value) })} min={1000} step={1000} />

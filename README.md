@@ -26,6 +26,28 @@
 | Ollama | `openai_compatible` | llama3、codellama |
 | 任意 OpenAI 兼容接口 | `openai_compatible` | — |
 
+## 协议转换矩阵
+
+网关以 **Chat Completions 作为唯一的转换枢纽**。渠道侧允许的协议取决于请求方的协议：
+
+| 请求方（入口） | Chat 渠道 | Anthropic (Messages) 渠道 | Responses 渠道 |
+|---|---|---|---|
+| Chat（`/v1/chat/completions`） | 透传 | ✗ | ✗ |
+| Messages（`/v1/messages`） | 转换 | 透传 | ✗ |
+| Responses（`/v1/responses`） | 转换 | ✗ | 透传 |
+
+规则一句话：**渠道侧要么与请求方同协议（字节透传），要么是 Chat 渠道（做转换）。**
+
+为什么这样限定：
+
+- 把 Messages / Responses 请求**拍平**成 Chat 是机械且安全的；反过来**从 Chat 造出** Messages / Responses 的完整语义（thinking、cache_control、Responses 的 item 生命周期）才是易错方向。
+- Messages ↔ Responses 需要两跳串联（中间经过 Chat），保真度差，同样不支持。
+
+由此带来两个行为，配置时需要知道：
+
+- **协议过滤优先于优先级**。不可服务的渠道会被直接排除——例如 Chat 请求方永远用不上你的 Claude 渠道，即使它 `priority: 1`。剩余候选之间仍严格按 `priority` 排序。
+- 没有渠道能服务该请求协议时，网关在**派发前**返回 `400` 并说明原因，不会静默降级、也不会白白消耗一次上游调用。
+
 ## 快速开始
 
 ### 使用预编译二进制
@@ -151,11 +173,17 @@ channels:
 
 | 字段 | 说明 | 默认值 |
 |---|---|---|
-| `max_retries` | 跨渠道最大重试次数 | `3` |
+| `max_failover_channels` | 单次请求最多尝试几个候选渠道（跨渠道上限）；`0` = 不限制 | `3` |
 | `retry_timeout_ms` | 单次重试超时 | `5000` |
 | `circuit_breaker.failure_threshold` | 触发熔断的连续失败次数 | `3` |
 | `circuit_breaker.recovery_interval_sec` | 熔断后恢复探测间隔（秒） | `30` |
 | `circuit_breaker.probe_requests` | 恢复阶段需连续成功的请求数 | `2` |
+
+> **两个不同维度的「重试」**：`failover.max_failover_channels` 约束一次请求最多尝试**几个渠道**（跨渠道）；
+> `channels[].retry_count` 约束同一个渠道内**重试几次**。二者相互独立——
+> 一次请求的总尝试次数上限约为 `max_failover_channels × (1 + retry_count)`。
+>
+> 早于本版本配置中的 `max_retries` 仍可正常加载，它等价于现在的 `max_failover_channels`。
 
 #### 鉴权配置 (`auth`)
 

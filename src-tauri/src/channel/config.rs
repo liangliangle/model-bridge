@@ -28,12 +28,34 @@ pub struct AppConfig {
     pub auth: AuthConfig, // 鉴权配置
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>, // MCP 中继上游 server 列表
+    /// 模型定价表（按实际模型精确匹配），用于成本计算
     #[serde(default)]
-    pub skill_manager: SkillManagerConfig, // Skill 统一管理配置
+    pub model_prices: Vec<ModelPrice>,
     /// 审计日志主表保留天数：None 或 0 = 永久留存；>0 = 删除超过 N 天的记录。
     /// 详情大字段（请求/响应体）始终只保留最近 1000 条，见 audit::db::BODIES_RETAIN_LATEST。
     #[serde(default)]
     pub audit_retention_days: Option<u32>,
+}
+
+/// 单个模型的定价（每百万 token，USD）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPrice {
+    /// 实际模型名（与审计日志 actual_model 精确匹配）
+    pub model: String,
+    /// 输入 token 单价（美元 / 百万 token）
+    #[serde(default)]
+    pub input_per_mtok: f64,
+    /// 输出 token 单价（美元 / 百万 token）
+    #[serde(default)]
+    pub output_per_mtok: f64,
+    /// 缓存读取单价；None 时回退到 input_per_mtok
+    #[serde(default)]
+    pub cache_read_per_mtok: Option<f64>,
+    /// 缓存写入单价；None 时回退到 input_per_mtok
+    #[serde(default)]
+    pub cache_write_per_mtok: Option<f64>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 /// 鉴权配置
@@ -151,7 +173,7 @@ fn default_priority() -> u32 {
     10
 }
 /// 默认启用
-fn default_true() -> bool {
+pub(crate) fn default_true() -> bool {
     true
 }
 /// 默认超时时间（毫秒）
@@ -172,11 +194,23 @@ pub enum ProviderType {
     Anthropic,         // Anthropic Messages API
 }
 
-/// 故障转移配置，控制重试次数、超时和熔断策略
+/// 故障转移配置：控制候选渠道数上限、超时和熔断策略。
+///
+/// 注意区分两个不同维度的「重试」：
+/// - 本结构体的 `max_failover_channels`：一次请求最多尝试**几个渠道**（跨渠道上限）。
+/// - `ChannelConfig::retry_count`：同一个渠道内**重试几次**。
+/// 二者此前混用同一个 `max_retries` 字段，已拆分。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailoverConfig {
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32, // 最大重试次数
+    /// 单次请求最多尝试的候选渠道数上限。`0` 表示不限制（尝试所有健康渠道）。
+    ///
+    /// 这是**候选渠道数量**的上限，不是重试次数；单渠道内重试次数见
+    /// [`ChannelConfig::retry_count`]。
+    ///
+    /// 兼容旧字段名 `max_retries`：二者语义相同（旧名易被误读为重试次数，
+    /// 且旧实现下取值 `0` 会清空全部候选渠道，导致所有请求返回 503）。
+    #[serde(default = "default_max_failover_channels", alias = "max_retries")]
+    pub max_failover_channels: u32,
     #[serde(default = "default_retry_timeout")]
     pub retry_timeout_ms: u64, // 单次重试超时时间（毫秒）
     #[serde(default)]
@@ -186,17 +220,27 @@ pub struct FailoverConfig {
 impl Default for FailoverConfig {
     fn default() -> Self {
         Self {
-            max_retries: default_max_retries(),
+            max_failover_channels: default_max_failover_channels(),
             retry_timeout_ms: default_retry_timeout(),
             circuit_breaker: CircuitBreakerConfig::default(),
         }
     }
 }
 
-/// 默认最大重试次数
-fn default_max_retries() -> u32 {
+/// 候选渠道数上限的默认值（`0` = 不限制）
+fn default_max_failover_channels() -> u32 {
     3
 }
+
+/// 判断候选渠道数上限是否生效（`0` 视为不限制）
+pub fn candidate_limit(limit: u32) -> Option<usize> {
+    if limit == 0 {
+        None
+    } else {
+        Some(limit as usize)
+    }
+}
+
 /// 默认重试超时时间（毫秒）
 fn default_retry_timeout() -> u64 {
     5000
@@ -311,52 +355,6 @@ pub struct OAuthData {
     pub token_expires_at: Option<i64>, // Unix 秒
 }
 
-/// Skill 统一管理配置：扫描各 agent 的 skill 目录，以中心库为源做软链接启停/分发。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillManagerConfig {
-    /// 中心库路径（被管理 skill 的真实存储），默认 ~/.agents/skills
-    #[serde(default = "default_central_lib")]
-    pub central_lib: String,
-    /// 纳入扫描的 agent skill 根目录列表（内置 + 用户自定义）
-    #[serde(default = "default_skill_agents")]
-    pub agents: Vec<SkillAgentTarget>,
-}
-
-impl Default for SkillManagerConfig {
-    fn default() -> Self {
-        Self {
-            central_lib: default_central_lib(),
-            agents: default_skill_agents(),
-        }
-    }
-}
-
-/// 一个 agent 的 skill 根目录
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillAgentTarget {
-    pub name: String,      // 唯一标识：claude / cursor / 自定义
-    pub root_path: String, // skill 根目录，支持 ~ 和 ${HOME}
-    #[serde(default = "default_true")]
-    pub enabled: bool, // 是否纳入扫描
-    #[serde(default)]
-    pub builtin: bool, // 标记默认配置项，允许在 Agent 管理中删除
-    /// 该 agent 是否原生直接读取中心库（~/.agents/skills）。
-    /// 为 true 时中心库 skill 对它自动全部生效，无需也不应建软链接到 root_path。
-    #[serde(default)]
-    pub native_agents_dir: bool,
-}
-
-fn default_central_lib() -> String {
-    "~/.agents/skills".to_string()
-}
-
-fn default_skill_agents() -> Vec<SkillAgentTarget> {
-    vec![
-        SkillAgentTarget { name: "claude".to_string(), root_path: "~/.claude/skills".to_string(), enabled: true, builtin: true, native_agents_dir: false },
-        SkillAgentTarget { name: "cursor".to_string(), root_path: "~/.cursor/skills".to_string(), enabled: true, builtin: true, native_agents_dir: false },
-    ]
-}
-
 impl AppConfig {
     /// 从 YAML 文件加载配置，支持 ${VAR} 和 ${VAR:-default} 环境变量替换
     pub fn load_from_file(path: &Path) -> Result<Self, String> {
@@ -380,7 +378,7 @@ impl AppConfig {
             ultimate_fallback: None,
             auth: AuthConfig::default(),
             mcp_servers: vec![],
-            skill_manager: SkillManagerConfig::default(),
+            model_prices: vec![],
             audit_retention_days: None, // 默认永久留存
         }
     }
@@ -397,6 +395,11 @@ impl AppConfig {
             .collect();
         channels.sort_by_key(|c| c.priority);
         channels
+    }
+
+    /// 按实际模型名精确查找已启用的定价
+    pub fn find_model_price(&self, model: &str) -> Option<&ModelPrice> {
+        self.model_prices.iter().find(|p| p.enabled && p.model == model)
     }
 }
 
@@ -503,12 +506,26 @@ channels:
       "gpt-4o-mini": "claude-haiku-4"
 
 failover:
-  max_retries: 3
+  # 单次请求最多尝试几个候选渠道（跨渠道上限）；0 = 不限制。
+  # 注意：单渠道内的重试次数由 channels[].retry_count 控制，二者独立。
+  max_failover_channels: 3
   retry_timeout_ms: 5000
   circuit_breaker:
     failure_threshold: 3
     recovery_interval_sec: 30
     probe_requests: 2
+
+# 模型定价表（按实际模型精确匹配），用于成本计算。单价单位：美元 / 百万 token。
+# model_prices:
+#   - model: "gpt-4o"
+#     input_per_mtok: 2.5
+#     output_per_mtok: 10.0
+#     cache_read_per_mtok: 1.25
+#   - model: "claude-sonnet-4-6"
+#     input_per_mtok: 3.0
+#     output_per_mtok: 15.0
+#     cache_read_per_mtok: 0.30
+#     cache_write_per_mtok: 3.75
 
 # MCP 中继：转发到上游 MCP server 并按黑名单裁剪工具
 # 客户端接入地址为 http://<host>:<port>/mcp/<id>
@@ -524,17 +541,5 @@ failover:
 #       - "unused_tool_a"
 #       - "unused_tool_b"
 
-# Skill 统一管理：扫描各 agent 的 skill 目录，以中心库为源做软链接启停/分发
-# skill_manager:
-#   central_lib: "~/.agents/skills"   # 中心库（被管理 skill 的真实存储）
-#   agents:
-#     - name: "claude"
-#       root_path: "~/.claude/skills"
-#       enabled: true
-#       builtin: true
-#     - name: "cursor"
-#       root_path: "~/.cursor/skills"
-#       enabled: true
-#       builtin: true
 "#
 }

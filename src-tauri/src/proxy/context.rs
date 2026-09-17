@@ -5,11 +5,31 @@ use axum::http::{HeaderMap, header};
 use serde_json::Value;
 
 /// 入口请求格式
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFormat {
     OpenAI,     // /v1/chat/completions
     Anthropic,  // /v1/messages
     Responses,  // /v1/responses
+}
+
+impl InputFormat {
+    /// 协议名，用于错误提示与日志（与用户侧习惯称呼一致）。
+    pub fn protocol_name(&self) -> &'static str {
+        match self {
+            InputFormat::OpenAI => "chat",
+            InputFormat::Anthropic => "messages",
+            InputFormat::Responses => "responses",
+        }
+    }
+
+    /// 该入口协议下，渠道侧允许的协议类型描述（用于「无可用渠道」的错误提示）。
+    pub fn allowed_provider_hint(&self) -> &'static str {
+        match self {
+            InputFormat::OpenAI => "a chat channel",
+            InputFormat::Anthropic => "a messages or chat channel",
+            InputFormat::Responses => "a responses or chat channel",
+        }
+    }
 }
 
 /// 请求上下文

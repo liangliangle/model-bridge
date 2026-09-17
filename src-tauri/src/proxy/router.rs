@@ -8,7 +8,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::channel::failover::select_routes;
+use crate::channel::failover::{select_routes, RouteError};
 use crate::proxy::context::RequestContext;
 use crate::proxy::executor;
 use crate::proxy::server::AppState;
@@ -23,22 +23,42 @@ pub async fn route_request(state: Arc<AppState>, ctx: RequestContext) -> Respons
         ).into_response();
     }
     let config = state.config.read().clone();
-    let routes = select_routes(&config, &state.health_map, &ctx.model_alias, ctx.input_format);
-
-    // 无可用渠道
-    if routes.is_empty() {
-        if let Ok(id) = state.audit_db.create(
-            "POST", &ctx.path, &ctx.model_alias,
-            ctx.original_headers_str.as_deref(),
-            Some(&ctx.raw_body),
-            ctx.user_agent.as_deref(),
-        ) {
-            let _ = state.audit_db.update_error(id, 503, start.elapsed().as_millis() as u64, "No available channels");
+    // 路由：先按协议矩阵硬过滤（同协议或 Chat 渠道），再按优先级排序
+    let routes = match select_routes(&config, &state.health_map, &ctx.model_alias, ctx.input_format) {
+        Ok(routes) => routes,
+        Err(reason) => {
+            let (status, error_type, message) = match reason {
+                RouteError::NoAvailableChannel => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    "No available channels".to_string(),
+                ),
+                // 请求一律在派发前拒绝：不做「先发出去再失败重试」，
+                // 避免浪费一次上游调用，也让用户看到可定位的原因。
+                RouteError::UnsupportedProtocol { input } => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!(
+                        "No channel can serve the '{}' input protocol: this gateway requires {}. \
+                         Add a matching-format channel, or a chat channel to convert into.",
+                        input.protocol_name(),
+                        input.allowed_provider_hint(),
+                    ),
+                ),
+            };
+            if let Ok(id) = state.audit_db.create(
+                "POST", &ctx.path, &ctx.model_alias,
+                ctx.original_headers_str.as_deref(),
+                Some(&ctx.raw_body),
+                ctx.user_agent.as_deref(),
+            ) {
+                let _ = state.audit_db.update_error(id, status.as_u16(), start.elapsed().as_millis() as u64, &message);
+            }
+            return (status,
+                Json(json!({"error": {"message": message, "type": error_type}})),
+            ).into_response();
         }
-        return (StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": {"message": "No available channels", "type": "server_error"}})),
-        ).into_response();
-    }
+    };
 
     let mut last_error: Option<String> = None;
     let mut failover_chain: Vec<String> = Vec::new();

@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use super::common::{
     anthropic_stop_to_finish, finish_reason_to_status, finish_to_anthropic_stop, gen_id,
-    new_ns_reverse_map, status_to_finish_reason, unwrap_custom_tool_arguments,
+    new_ns_reverse_map, status_to_finish_reason, unwrap_custom_tool_arguments, StreamUsage,
     CUSTOM_TOOL_NAMESPACE_MARKER, NsReverseMap,
 };
 use super::ApiFormat;
@@ -177,6 +177,9 @@ struct ResponsesEmitter {
     next_output_index: i64,
     finished: bool,
     ns_reverse: NsReverseMap,
+    /// 上游 usage 累加，收尾时写入 `response.completed.response.usage`。
+    /// Responses 规范里 usage 是 response 对象的必填字段。
+    usage: StreamUsage,
 }
 
 impl ResponsesEmitter {
@@ -204,6 +207,7 @@ impl ResponsesEmitter {
             next_output_index: 1,
             finished: false,
             ns_reverse,
+            usage: StreamUsage::default(),
         }
     }
 
@@ -230,6 +234,19 @@ impl ResponsesEmitter {
             "status": status,
             "output": output,
         })
+    }
+
+    /// 收尾响应体：在 [`Self::base_response`] 基础上带上 `usage`。
+    ///
+    /// Responses 规范中 `usage` 是 response 对象的**必填字段**，`response.completed`
+    /// 必须给出；上游未提供时给零值对象，而不是省略该字段或填 null，
+    /// 否则按类型解析的客户端会在必填字段上失败。
+    fn final_response(&self, status: &str, output: Value) -> Value {
+        let mut resp = self.base_response(status, output);
+        if let Some(m) = resp.as_object_mut() {
+            m.insert("usage".to_string(), self.usage.to_responses_usage());
+        }
+        resp
     }
 
     fn ensure_started(&mut self, out: &mut Vec<Vec<u8>>) {
@@ -591,7 +608,7 @@ impl ResponsesEmitter {
             }
         }
         let status = self.status.clone();
-        let resp = self.base_response(&status, output);
+        let resp = self.final_response(&status, output);
         out.push(self.emit("response.completed", json!({ "response": resp })));
     }
 }
@@ -634,6 +651,10 @@ impl ChatCompletionsToResponsesStream {
                 if let Some(m) = json.get("model").and_then(|v| v.as_str()) {
                     self.emitter.model = m.to_string();
                 }
+            }
+            // 上游 usage chunk（choices 为空数组）必须先于收尾累加
+            if let Some(u) = json.get("usage") {
+                self.emitter.usage.merge_chat(u);
             }
             self.emitter.ensure_started(&mut out);
 
@@ -686,8 +707,9 @@ impl ChatCompletionsToResponsesStream {
                 .and_then(|c| c.get("finish_reason"))
                 .and_then(|v| v.as_str())
             {
+                // 只记录状态，收尾推迟到 [DONE] / finalize()：上游的 usage chunk
+                // 位于 finish_reason 之后，提前收尾会把 usage 丢掉。
                 self.emitter.status = finish_reason_to_status(Some(fr)).to_string();
-                self.emitter.finish(&mut out);
             }
         }
         out
@@ -764,6 +786,10 @@ impl AnthropicToResponsesStream {
                     {
                         self.emitter.model = m.to_string();
                     }
+                    // Anthropic 在 message_start 给出输入 token
+                    if let Some(u) = json.get("message").and_then(|m| m.get("usage")) {
+                        self.emitter.usage.merge_anthropic(u);
+                    }
                     self.emitter.ensure_started(&mut out);
                 }
                 "content_block_start" => {
@@ -839,6 +865,11 @@ impl AnthropicToResponsesStream {
                     }
                 }
                 "message_delta" => {
+                    // Anthropic 在 message_delta 给出累计输出 token；
+                    // 该事件先于 message_stop，因此收尾时 usage 已经齐备。
+                    if let Some(u) = json.get("usage") {
+                        self.emitter.usage.merge_anthropic(u);
+                    }
                     if let Some(sr) = json
                         .get("delta")
                         .and_then(|d| d.get("stop_reason"))
@@ -1268,6 +1299,10 @@ pub struct ChatToAnthropicStream {
     reasoning_index: Option<i64>,
     tool_blocks: std::collections::HashMap<i64, i64>,
     has_tool: bool,
+    /// 上游 Chat usage 累加（末尾 usage chunk 可能晚于 finish_reason 到达）
+    usage: StreamUsage,
+    /// 已知的结束原因，暂存到流末尾再收尾，以便带上真实 usage
+    pending_stop: Option<String>,
 }
 
 impl ChatToAnthropicStream {
@@ -1284,6 +1319,8 @@ impl ChatToAnthropicStream {
             reasoning_index: None,
             tool_blocks: std::collections::HashMap::new(),
             has_tool: false,
+            usage: StreamUsage::default(),
+            pending_stop: None,
         }
     }
 
@@ -1312,7 +1349,7 @@ impl ChatToAnthropicStream {
                     "model": self.model,
                     "content": [],
                     "stop_reason": Value::Null,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                    "usage": self.usage.to_anthropic_message_usage()
                 }
             }),
         ));
@@ -1385,7 +1422,13 @@ impl StreamConverter for ChatToAnthropicStream {
         let mut out: Vec<Vec<u8>> = Vec::new();
         for ev in self.sse.drain_events() {
             if ev.data == "[DONE]" {
-                self.finish_into(&mut out, "end_turn");
+                // 上游的 usage chunk 位于 finish_reason 之后、[DONE] 之前，
+                // 所以推迟到 [DONE] 才收尾，否则会丢掉 usage。
+                let stop = self
+                    .pending_stop
+                    .clone()
+                    .unwrap_or_else(|| "end_turn".to_string());
+                self.finish_into(&mut out, &stop);
                 continue;
             }
             let json: Value = match serde_json::from_str(&ev.data) {
@@ -1396,6 +1439,10 @@ impl StreamConverter for ChatToAnthropicStream {
                 if let Some(m) = json.get("model").and_then(|v| v.as_str()) {
                     self.model = m.to_string();
                 }
+            }
+            // usage chunk 的 choices 为空数组，必须在取 choice 之前捕获
+            if let Some(u) = json.get("usage") {
+                self.usage.merge_chat(u);
             }
             let choice = json
                 .get("choices")
@@ -1482,8 +1529,8 @@ impl StreamConverter for ChatToAnthropicStream {
                 .and_then(|c| c.get("finish_reason"))
                 .and_then(|v| v.as_str())
             {
-                let stop = finish_to_anthropic_stop(Some(fr));
-                self.finish_into(&mut out, stop);
+                // 暂存结束原因，推迟到 [DONE] / finalize 收尾，以便带上真实 usage
+                self.pending_stop = Some(finish_to_anthropic_stop(Some(fr)).to_string());
             }
         }
         out
@@ -1491,7 +1538,11 @@ impl StreamConverter for ChatToAnthropicStream {
 
     fn finalize(&mut self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        self.finish_into(&mut out, "end_turn");
+        let stop = self
+            .pending_stop
+            .clone()
+            .unwrap_or_else(|| "end_turn".to_string());
+        self.finish_into(&mut out, &stop);
         out
     }
 }
@@ -1514,7 +1565,7 @@ impl ChatToAnthropicStream {
             json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop, "stop_sequence": Value::Null},
-                "usage": {"output_tokens": 0}
+                "usage": self.usage.to_anthropic_delta_usage()
             }),
         ));
         out.push(Self::sse("message_stop", json!({"type": "message_stop"})));
@@ -1536,6 +1587,8 @@ pub struct ResponsesToAnthropicStream {
     reasoning_index: Option<i64>,
     tool_blocks: std::collections::HashMap<String, i64>,
     has_tool: bool,
+    /// 上游 Responses usage 累加（`response.completed` 等事件的 response.usage）
+    usage: StreamUsage,
 }
 
 impl ResponsesToAnthropicStream {
@@ -1552,6 +1605,7 @@ impl ResponsesToAnthropicStream {
             reasoning_index: None,
             tool_blocks: std::collections::HashMap::new(),
             has_tool: false,
+            usage: StreamUsage::default(),
         }
     }
 
@@ -1580,7 +1634,7 @@ impl ResponsesToAnthropicStream {
                     "model": self.model,
                     "content": [],
                     "stop_reason": Value::Null,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                    "usage": self.usage.to_anthropic_message_usage()
                 }
             }),
         ));
@@ -1657,7 +1711,7 @@ impl ResponsesToAnthropicStream {
             json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop, "stop_sequence": Value::Null},
-                "usage": {"output_tokens": 0}
+                "usage": self.usage.to_anthropic_delta_usage()
             }),
         ));
         out.push(Self::sse("message_stop", json!({"type": "message_stop"})));
@@ -1694,6 +1748,13 @@ impl StreamConverter for ResponsesToAnthropicStream {
                     .and_then(|v| v.as_str())
                 {
                     self.model = m.to_string();
+                }
+            }
+            // 任一带 response.usage 的事件都累加：created/in_progress 可能先给输入，
+            // completed 给最终累计值。必须在本轮 match 调用 finish_into 之前完成。
+            if let Some(u) = json.get("response").and_then(|r| r.get("usage")) {
+                if !u.is_null() {
+                    self.usage.merge_responses(u);
                 }
             }
             match etype {

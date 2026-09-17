@@ -144,6 +144,129 @@ pub fn chat_usage_to_anthropic(usage: &Value) -> Value {
     out
 }
 
+// ==================== 流式 usage 累加 ====================
+
+/// 流式响应 usage 累加器。
+///
+/// 三套协议下发 usage 的位置各不相同：
+/// - Chat：末尾一个 `choices: []` 的 chunk 带 `usage`（需上游开启 `stream_options.include_usage`）
+/// - Responses：`response.completed` 等事件的 `response.usage`
+/// - Anthropic：`message_start` 给输入、`message_delta` 给累计输出
+///
+/// 入口协议只在收尾事件里输出 usage，而上游可能更晚才给到，因此这里先累加、
+/// 收尾时统一输出。此前这些位置被写死为 0，导致客户端拿到的 token 数恒为 0。
+///
+/// 合并策略：仅当读到**非零**值时覆盖，因此后到的、缺字段的事件不会清掉先到的值。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+}
+
+impl StreamUsage {
+    fn set_if_positive(target: &mut Option<u64>, value: Option<u64>) {
+        if let Some(v) = value {
+            if v > 0 {
+                *target = Some(v);
+            }
+        }
+    }
+
+    /// OpenAI Chat 格式 usage（`prompt_tokens` / `completion_tokens`）。
+    ///
+    /// Chat 的 `prompt_tokens` **包含**缓存命中部分，而 Anthropic 的 `input_tokens`
+    /// 不含（两者相加才是总输入），因此这里扣除 cached 后再存入，与
+    /// [`chat_usage_to_anthropic`] 的非流式口径保持一致，避免下游重复计数。
+    pub fn merge_chat(&mut self, usage: &Value) {
+        let cached = usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64);
+        if let Some(total) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+            Self::set_if_positive(&mut self.input_tokens, Some(total.saturating_sub(cached.unwrap_or(0))));
+        }
+        Self::set_if_positive(&mut self.output_tokens, usage.get("completion_tokens").and_then(Value::as_u64));
+        Self::set_if_positive(&mut self.cache_read_tokens, cached);
+    }
+
+    /// OpenAI Responses 格式 usage（`input_tokens` / `output_tokens`）。
+    /// 输入 token 同样包含缓存命中部分，口径处理见 [`Self::merge_chat`]。
+    pub fn merge_responses(&mut self, usage: &Value) {
+        let cached = usage
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64);
+        if let Some(total) = usage.get("input_tokens").and_then(Value::as_u64) {
+            Self::set_if_positive(&mut self.input_tokens, Some(total.saturating_sub(cached.unwrap_or(0))));
+        }
+        Self::set_if_positive(&mut self.output_tokens, usage.get("output_tokens").and_then(Value::as_u64));
+        Self::set_if_positive(&mut self.cache_read_tokens, cached);
+    }
+
+    /// Anthropic 格式 usage（含缓存读 / 写两类字段）。
+    pub fn merge_anthropic(&mut self, usage: &Value) {
+        Self::set_if_positive(&mut self.input_tokens, usage.get("input_tokens").and_then(Value::as_u64));
+        Self::set_if_positive(&mut self.output_tokens, usage.get("output_tokens").and_then(Value::as_u64));
+        Self::set_if_positive(&mut self.cache_read_tokens, usage.get("cache_read_input_tokens").and_then(Value::as_u64));
+        Self::set_if_positive(&mut self.cache_creation_tokens, usage.get("cache_creation_input_tokens").and_then(Value::as_u64));
+    }
+
+    /// Anthropic `message_start.message.usage` 形态。
+    /// 未获知输入 token 时退化为 0，与 Anthropic 首帧一致。
+    pub fn to_anthropic_message_usage(&self) -> Value {
+        let mut m = Map::new();
+        m.insert("input_tokens".to_string(), json!(self.input_tokens.unwrap_or(0)));
+        m.insert("output_tokens".to_string(), json!(self.output_tokens.unwrap_or(0)));
+        if let Some(v) = self.cache_read_tokens {
+            m.insert("cache_read_input_tokens".to_string(), json!(v));
+        }
+        if let Some(v) = self.cache_creation_tokens {
+            m.insert("cache_creation_input_tokens".to_string(), json!(v));
+        }
+        Value::Object(m)
+    }
+
+    /// Anthropic `message_delta.usage` 形态。
+    ///
+    /// Anthropic 的 message_delta 承载的是「累计」用量（当前 API 版本同时给出
+    /// 输入与输出 token），而 Chat / Responses 上游也只在结束时给一次累计值，
+    /// 因此这里直接输出累计值，不做增量拆分。
+    pub fn to_anthropic_delta_usage(&self) -> Value {
+        self.to_anthropic_message_usage()
+    }
+
+    /// Responses `response.completed.response.usage` 形态。
+    ///
+    /// Responses 的 `input_tokens` 与 Chat 一致，**包含**缓存命中部分，因此这里
+    /// 把 [`Self::merge_chat`] / [`Self::merge_responses`] 扣除的 cached 加回去，
+    /// 保证跨协议往返不失真。
+    pub fn to_responses_usage(&self) -> Value {
+        let cached = self.cache_read_tokens.unwrap_or(0);
+        let creation = self.cache_creation_tokens.unwrap_or(0);
+        let input = self.input_tokens.unwrap_or(0) + cached + creation;
+        let output = self.output_tokens.unwrap_or(0);
+        let mut out = json!({
+            "input_tokens": input,
+            "output_tokens": output,
+            "total_tokens": input + output,
+        });
+        let mut details = Map::new();
+        if cached > 0 {
+            details.insert("cached_tokens".to_string(), json!(cached));
+        }
+        // Responses 无缓存写入概念，但 Anthropic 上游会给出，保留以免丢信息
+        if creation > 0 {
+            details.insert("cache_creation_tokens".to_string(), json!(creation));
+        }
+        if !details.is_empty() {
+            out["input_tokens_details"] = Value::Object(details);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

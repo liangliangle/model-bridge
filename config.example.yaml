@@ -96,7 +96,9 @@ channels:
       "code": "codellama"
 
 failover:
-  max_retries: 3
+  # 单次请求最多尝试几个候选渠道（跨渠道上限）；0 = 不限制。
+  # 注意：单渠道内的重试次数由 channels[].retry_count 控制，二者独立。
+  max_failover_channels: 3
   retry_timeout_ms: 5000
   circuit_breaker:
     failure_threshold: 3

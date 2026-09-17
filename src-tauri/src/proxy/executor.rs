@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::channel::config::{ChannelConfig, ProviderType};
+use crate::channel::config::{AppConfig, ChannelConfig, ProviderType};
 use crate::provider::{collect_forwarded_headers, headers_to_json};
 use crate::proxy::context::RequestContext;
 use crate::proxy::server::AppState;
@@ -39,8 +39,13 @@ pub async fn execute_on_channel(
         tracing::debug!(audit_id, "[DEBUG] >>> Original body:\n{}", pretty_json(&ctx.raw_body));
     }
 
-    // 计算格式转换器：格式一致返回 None（透传），否则返回 Some(fc) 做协议转换
-    let converter = crate::converter::FormatConverter::from_formats(ctx.input_format, &channel.provider);
+    // 计算格式转换器：格式一致 → None（透传），受支持的跨协议 → Some(fc)。
+    // 路由层已按协议矩阵过滤掉不可服务的渠道，这里报错属于兜底：
+    // 宁可返回明确错误，也不能退化成把错误协议发给上游。
+    let converter = match crate::converter::FormatConverter::plan(ctx.input_format, &channel.provider) {
+        Ok(converter) => converter,
+        Err(unsupported) => return Err(format!("invalid_request: {unsupported}")),
+    };
 
     let mut send_body_str = match &converter {
         None => {
@@ -54,7 +59,13 @@ pub async fn execute_on_channel(
                 }
             }
             // 跨格式：入口格式 → Chat → 目标 provider 格式
-            let converted = fc.convert_request(&ctx.parsed_body, actual_model);
+            let mut converted = fc.convert_request(&ctx.parsed_body, actual_model);
+            // Chat 目标的流式请求必须显式要求上游下发 usage：OpenAI Chat 默认不在
+            // 流里带 usage，不开启则流式请求的 token 审计与下发 usage 都会归零。
+            // 仅转换路径注入；透传路径保持客户端原始请求体不变。
+            if ctx.is_stream && fc.to_format() == crate::converter::ApiFormat::OpenAIChat {
+                ensure_chat_stream_usage(&mut converted);
+            }
             let s = serde_json::to_string(&converted).unwrap_or_else(|_| ctx.raw_body.clone());
             if debug {
                 tracing::debug!(audit_id, "[DEBUG] >>> Converted body ({:?} → {:?}):\n{}",
@@ -186,6 +197,7 @@ pub async fn execute_on_channel(
                         .unwrap_or_else(|_| String::from_utf8_lossy(&sse_bytes).to_string());
                     let latency = start.elapsed().as_millis() as u64;
                     let tokens = crate::audit::db::extract_tokens_from_json(&up);
+                    let cost = compute_cost_from_config(&state, actual_model, &tokens);
                     let _ = state.audit_db.update_first_byte(
                         audit_id, latency,
                         Some(&resp_headers_json), Some(&resp_headers_json),
@@ -194,7 +206,7 @@ pub async fn execute_on_channel(
                         audit_id, status, latency,
                         Some(&resp_headers_json), Some(&raw),
                         Some(&resp_headers_json), Some(&converted_text),
-                        &tokens,
+                        &tokens, cost,
                     );
                     if debug {
                         tracing::debug!(audit_id,
@@ -405,6 +417,22 @@ pub async fn execute_on_channel(
                     }
                     Err(_) => {
                         tracing::warn!("Streaming idle timeout ({}s)", timeout.as_secs());
+                        // 超时同样要让转换器收尾，否则下游会缺 message_stop / finish_reason。
+                        // （Chat→Anthropic 的 usage 收尾依赖 finalize，缺了会丢结束事件。）
+                        if let Some(sc) = stream_conv.as_mut() {
+                            let mut merged = Vec::<u8>::new();
+                            for part in sc.finalize() {
+                                merged.extend_from_slice(&part);
+                            }
+                            if !merged.is_empty() {
+                                forwarded.lock().extend_from_slice(&merged);
+                                if let Some(tx) = done_tx.lock().take() { let _ = tx.send(()); }
+                                return Some((
+                                    Ok(bytes::Bytes::from(merged)),
+                                    (stream, timeout, collected, done_tx, stream_conv, true, produced_any, fc_copy, actual_model_owned, None),
+                                ));
+                            }
+                        }
                         if let Some(tx) = done_tx.lock().take() { let _ = tx.send(()); }
                         None
                     }
@@ -415,20 +443,24 @@ pub async fn execute_on_channel(
         // 后台：流结束后更新审计
         let stream_start = start;
         let upstream_status_for_audit = status;
+        let actual_model_for_cost = actual_model.to_string();
+        let config_for_cost = state.config.clone();
         tokio::spawn(async move {
             let _ = done_rx.await;
             let total_latency = stream_start.elapsed().as_millis() as u64;
             let raw_bytes = collected_for_audit.lock().clone();
             if !raw_bytes.is_empty() {
                 let raw_text = String::from_utf8_lossy(&raw_bytes).to_string();
+                let tokens = extract_tokens_for_stream_cost(&raw_text);
+                let cost = compute_cost_from_config_ref(&config_for_cost, &actual_model_for_cost, &tokens);
                 if has_converter {
                     // 转换路径：response_body 记录转换后下发内容，upstream_response_body 记录上游原始
                     let fwd_bytes = forwarded_for_audit.lock().clone();
                     let fwd_text = String::from_utf8_lossy(&fwd_bytes).to_string();
-                    let _ = audit_db.update_streaming_response(audit_id, &raw_text, Some(&fwd_text), Some(upstream_status_for_audit), total_latency);
+                    let _ = audit_db.update_streaming_response(audit_id, &raw_text, Some(&fwd_text), Some(upstream_status_for_audit), total_latency, cost);
                 } else {
                     // 透传路径：无转换，两者一致
-                    let _ = audit_db.update_streaming_response(audit_id, &raw_text, None, Some(upstream_status_for_audit), total_latency);
+                    let _ = audit_db.update_streaming_response(audit_id, &raw_text, None, Some(upstream_status_for_audit), total_latency, cost);
                 }
             }
         });
@@ -466,6 +498,7 @@ pub async fn execute_on_channel(
     let tokens = serde_json::from_str::<Value>(&raw_resp_text).ok()
         .map(|v| crate::audit::db::extract_tokens_from_json(&v))
         .unwrap_or_default();
+    let cost = compute_cost_from_config(&state, actual_model, &tokens);
 
     // 转换路径：把上游响应转回入口格式；透传路径原样返回
     let response_body_str = match &converter {
@@ -488,7 +521,7 @@ pub async fn execute_on_channel(
         audit_id, status, start.elapsed().as_millis() as u64,
         Some(&resp_headers_json), Some(&raw_resp_text),
         Some(&resp_headers_json), Some(&response_body_str),
-        &tokens,
+        &tokens, cost,
     );
 
     Ok(axum::response::Response::builder()
@@ -617,6 +650,22 @@ pub fn sse_has_content_output(bytes: &[u8]) -> bool {
 
 // ==================== 工具函数 ====================
 
+/// 从配置中按实际模型查找定价并计算成本；未配置定价时返回 None。
+fn compute_cost_from_config(state: &Arc<AppState>, actual_model: &str, tokens: &crate::audit::db::TokenUsage) -> Option<f64> {
+    compute_cost_from_config_ref(&state.config, actual_model, tokens)
+}
+
+fn compute_cost_from_config_ref(config: &Arc<parking_lot::RwLock<AppConfig>>, actual_model: &str, tokens: &crate::audit::db::TokenUsage) -> Option<f64> {
+    let cfg = config.read();
+    let price = cfg.find_model_price(actual_model)?;
+    Some(crate::cost::compute_cost(price, tokens.input, tokens.output, tokens.cache_read, tokens.cache_creation))
+}
+
+/// 从流式原始响应中提取 token 用量（供后台成本计算）
+fn extract_tokens_for_stream_cost(raw_stream: &str) -> crate::audit::db::TokenUsage {
+    crate::audit::db::extract_tokens_from_stream(raw_stream)
+}
+
 /// 尝试格式化 JSON 字符串，失败则原样返回
 fn pretty_json(raw: &str) -> String {
     serde_json::from_str::<Value>(raw)
@@ -655,6 +704,25 @@ fn set_stream_in_json_str(raw: &str, is_stream: bool) -> String {
         }
     }
     serde_json::to_string(&body).unwrap_or_else(|_| raw.to_string())
+}
+
+/// 为 Chat 目标的流式请求打开 `stream_options.include_usage`。
+///
+/// OpenAI Chat Completions 默认不在流式响应里返回 usage，只有请求显式带上
+/// `stream_options.include_usage: true` 才会在末尾下发一个 `choices: []` 的
+/// usage chunk。转换路径的入口协议（Anthropic / Responses）没有这个字段，
+/// 因此由网关补齐，否则流式请求的 token 统计恒为 0。
+fn ensure_chat_stream_usage(body: &mut Value) {
+    let obj = match body.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    let options = obj
+        .entry("stream_options".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(options) = options.as_object_mut() {
+        options.insert("include_usage".to_string(), Value::Bool(true));
+    }
 }
 
 /// 强制覆盖请求体中的 output_config.effort 字段。
@@ -882,5 +950,28 @@ mod tests {
             let t = b["type"].as_str().unwrap_or("");
             assert_ne!(t, "redacted_thinking", "redacted_thinking must also be removed");
         }
+    }
+
+    #[test]
+    fn test_ensure_chat_stream_usage_sets_flag() {
+        let mut body = serde_json::json!({"model": "m", "stream": true, "messages": []});
+        ensure_chat_stream_usage(&mut body);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    /// 已有 stream_options 时只补 include_usage，不能整体覆盖掉其它选项。
+    #[test]
+    fn test_ensure_chat_stream_usage_preserves_existing_options() {
+        let mut body = serde_json::json!({"stream_options": {"custom_key": 1}});
+        ensure_chat_stream_usage(&mut body);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["stream_options"]["custom_key"], 1);
+    }
+
+    #[test]
+    fn test_ensure_chat_stream_usage_ignores_non_object_body() {
+        let mut body = serde_json::json!("not an object");
+        ensure_chat_stream_usage(&mut body);
+        assert_eq!(body, serde_json::json!("not an object"));
     }
 }

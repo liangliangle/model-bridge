@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use super::config::{AppConfig, ChannelConfig, MappingSource, ProviderType};
+use super::config::{candidate_limit, AppConfig, ChannelConfig, MappingSource};
 use super::health::HealthMap;
+
+use crate::converter::FormatConverter;
 use crate::proxy::context::InputFormat;
 
 /// 路由决策结果，表示为某个模型别名选中的渠道和实际模型
@@ -22,31 +24,39 @@ pub struct FailoverAttempt {
     pub latency_ms: u64,              // 请求耗时（毫秒）
 }
 
-/// 判断渠道的 ProviderType 是否与输入格式一致（用于同格式优先排序，不再做硬过滤）
-fn format_matches(input: InputFormat, provider: &ProviderType) -> bool {
-    matches!(
-        (input, provider),
-        (InputFormat::OpenAI, ProviderType::Openai)
-        | (InputFormat::Anthropic, ProviderType::Anthropic)
-        | (InputFormat::Responses, ProviderType::OpenaiResponses)
-    )
+/// 路由失败原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteError {
+    /// 没有任何启用且可用的渠道。
+    NoAvailableChannel,
+    /// 有可用渠道，但协议矩阵不允许服务该入口协议（渠道侧既非同协议也非 Chat）。
+    UnsupportedProtocol { input: InputFormat },
 }
 
 /// 为指定模型别名选择可用的渠道路由列表。
-/// 所有健康且可路由的渠道都进入候选（跨格式渠道由 converter 层做协议转换），
-/// 同格式渠道优先排序（transform 成本更低），同格式/跨格式各自内部保持优先级顺序。
+///
+/// 两层规则，顺序不能颠倒：
+/// 1. **硬过滤**：渠道必须能服务该入口协议——同协议（透传）或 Chat（转换），
+///    由 [`FormatConverter::is_supported`] 判定。不可服务的渠道直接排除，
+///    绝不允许退化成错误的协议转换。
+/// 2. **优先级排序**：在剩下的候选里，顺序**完全由 `priority` 决定**
+///    （数值越小越靠前），协议格式不再参与排序；优先级相同时保持配置文件顺序。
+///
+/// 候选数量上限由 `failover.max_failover_channels` 控制，`0` 表示不限制。
+/// 该上限只约束「尝试几个渠道」，与单渠道内重试次数（`channel.retry_count`）无关。
 pub fn select_routes(
     config: &AppConfig,
     health_map: &HealthMap,
     model_alias: &str,
     input_format: InputFormat,
-) -> Vec<RouteDecision> {
+) -> Result<Vec<RouteDecision>, RouteError> {
     let health = health_map.read();
-    let max = config.failover.max_retries as usize;
+    let max_candidates = candidate_limit(config.failover.max_failover_channels);
 
-    // 先按优先级收集所有健康渠道，再按「是否同格式」稳定分区，同格式在前
-    let mut same_format: Vec<RouteDecision> = Vec::new();
-    let mut cross_format: Vec<RouteDecision> = Vec::new();
+    // sorted_channels() 已按 priority 升序稳定排序，过滤后仍保持该顺序
+    let mut routes: Vec<RouteDecision> = Vec::new();
+    // 健康且启用的渠道总数（不论协议），用于区分「没渠道」与「渠道协议不匹配」
+    let mut healthy_total = 0usize;
 
     for channel in config.sorted_channels() {
         let channel_health = health.get(&channel.id);
@@ -54,38 +64,50 @@ pub fn select_routes(
         if !is_available {
             continue;
         }
+        healthy_total += 1;
+
+        if !FormatConverter::is_supported(input_format, &channel.provider) {
+            continue;
+        }
 
         let (actual_model, mapping_source) = channel.resolve_model(model_alias);
-        let decision = RouteDecision {
+        routes.push(RouteDecision {
             channel: channel.clone(),
             actual_model,
             mapping_source,
-        };
-
-        if format_matches(input_format, &channel.provider) {
-            same_format.push(decision);
-        } else {
-            cross_format.push(decision);
-        }
+        });
     }
 
-    let mut routes: Vec<RouteDecision> = same_format;
-    routes.extend(cross_format);
-    routes.truncate(max);
+    // 0 = 不限制：绝不能退化成 truncate(0) 清空全部候选，否则所有请求都会 503
+    if let Some(limit) = max_candidates {
+        routes.truncate(limit);
+    }
 
-    // 所有渠道不可用时，尝试终极兜底渠道（不再要求格式匹配，跨格式由 converter 处理）
+    // 终极兜底渠道同样要满足协议矩阵，否则会退化成已下线的转换方向
     if routes.is_empty() {
         if let Some(ref fallback) = config.ultimate_fallback {
             if let Some(channel) = config.channels.iter().find(|c| c.id == fallback.channel) {
-                let (actual_model, mapping_source) = channel.resolve_model(model_alias);
-                routes.push(RouteDecision {
-                    channel: channel.clone(),
-                    actual_model,
-                    mapping_source,
-                });
+                if FormatConverter::is_supported(input_format, &channel.provider) {
+                    let (actual_model, mapping_source) = channel.resolve_model(model_alias);
+                    routes.push(RouteDecision {
+                        channel: channel.clone(),
+                        actual_model,
+                        mapping_source,
+                    });
+                }
             }
         }
     }
 
-    routes
+    if !routes.is_empty() {
+        return Ok(routes);
+    }
+    // 有健康渠道却一个都用不上 → 是协议不匹配，而不是「没有渠道」
+    if healthy_total > 0 {
+        Err(RouteError::UnsupportedProtocol {
+            input: input_format,
+        })
+    } else {
+        Err(RouteError::NoAvailableChannel)
+    }
 }
