@@ -89,7 +89,9 @@ Invariants:
 | `cd src-tauri && cargo test` | Run all tests (115 today) |
 | `cd src-tauri && cargo build --release` | Build Rust backend (release) |
 | `cd src-tauri && cargo run` | Run backend locally |
-| `./build.sh` | Full release build: frontend + backend → single binary in `release/` |
+| `./build.sh` | Full build: frontend + Go backend → single binary in `release/` (`SKIP_FRONTEND=1` skips the frontend) |
+| `./restart.sh` | Stop the running server, rebuild the Go backend, start it in the background (PID in `.model-bridge.pid`, log in `model-bridge.log`) |
+| `./build-rust.sh` / `./restart-rust.sh` | The original Rust-only scripts, kept as-is |
 | `cd go && ./build.sh` | Sync `dist/` into the Go module and build `go/bin/model-bridge` |
 | `cd go && go build -p 1 ./...` | Build the Go backend (serial: this machine has little RAM) |
 | `cd go && go test -p 1 ./...` | Run Go unit + end-to-end tests |
@@ -100,9 +102,15 @@ Invariants:
 `pnpm build` must run *before* `cargo build`. The Go module has the same constraint for a
 different reason: `//go:embed` cannot reference files outside the module directory, so
 `go/build.sh` copies the repo's `dist/` into `go/internal/web/dist/` before compiling. That copy
-is committed so a fresh clone can build without running the frontend build first. The generated `embedded_assets.rs` records absolute
-paths, so if the checkout moves, `cargo test` fails with `couldn't read .../dist/...` — run
-`touch build.rs` to force the build script to regenerate.
+is committed so a fresh clone can build without running the frontend build first.
+
+The generated `embedded_assets.rs` records absolute paths, so if the checkout moves,
+`cargo test` fails with `couldn't read .../dist/...` — run `touch build.rs` to force the build
+script to regenerate. The Go side has no such trap; it only needs the module directory present.
+
+The listen address comes from `listen_host` / `listen_port` in `~/.model-bridge/config.yaml`
+(defaults `127.0.0.1:8080`). `./restart.sh` reads the port back out of that file, so it probes the
+same address the server actually binds.
 
 The running app serves the UI at `http://localhost:8080` and proxies all three protocol
 endpoints: `/v1/chat/completions`, `/v1/messages`, `/v1/responses`.
