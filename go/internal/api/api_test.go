@@ -23,6 +23,7 @@ import (
 	"modelbridge/internal/app"
 	"modelbridge/internal/audit"
 	"modelbridge/internal/config"
+	"modelbridge/internal/mcp"
 )
 
 // testConfigYAML 测试用配置：两个渠道 + failover + 一条模型价格 + 一个 MCP server。
@@ -133,7 +134,7 @@ func newTestEnv(t *testing.T) *testEnv {
 
 	state := app.New(cfg, configPath, db)
 	mux := http.NewServeMux()
-	api.Register(mux, state)
+	api.Register(mux, state, mcp.NewState(state, state.HTTP, state.Audit))
 	return &testEnv{t: t, dir: dir, configPath: configPath, state: state, mux: mux, db: db}
 }
 

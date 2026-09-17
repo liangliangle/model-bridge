@@ -59,15 +59,16 @@ func ExecuteOnChannel(state *app.State, ctx *RequestContext, rt Route, auditID i
 	ch := rt.Channel
 	debug := state.Config().Debug
 	to := FormatFromProvider(ch.Provider)
-	convert := ctx.Format != to
-
-	// 兜底校验：路由层已按矩阵过滤，能走到这里说明矩阵被绕过。
-	if convert && !ctx.Format.CanRouteTo(to) {
+	// 方向只在这里确定一次：下游=入口协议，上游=渠道协议。
+	// 请求方向与响应方向共用这个 Hop，因此不可能把两个方向写反。
+	hop, herr := converter.NewHop(ctx.Format.AsClient(), to.AsChannel())
+	if herr != nil {
+		// 路由层已按矩阵过滤，能走到这里说明矩阵被绕过。
 		return fmt.Errorf("invalid_request: cannot convert %s request to a %s channel", ctx.Format, to)
 	}
+	convert := hop.Converts()
 
-	session := converter.NewSession()
-	sendBody, err := buildUpstreamBody(ctx, rt, session, to, convert)
+	sendBody, err := buildUpstreamBody(ctx, rt, hop)
 	if err != nil {
 		return err
 	}
@@ -143,22 +144,22 @@ func ExecuteOnChannel(state *app.State, ctx *RequestContext, rt Route, auditID i
 
 	if ctx.IsStream {
 		return streamFromUpstream(streamArgs{
-			state: state, ctx: ctx, rt: rt, session: session, convert: convert,
-			to: to, auditID: auditID, w: w, start: start, status: status,
+			state: state, ctx: ctx, rt: rt, hop: hop,
+			auditID: auditID, w: w, start: start, status: status,
 			respHeadersJSON: respHeadersJSON, upstreamCT: upstreamCT,
 			body: resp.Body, cancel: cancel, debug: debug,
 		})
 	}
 
 	// 非流式在这里就结束，必须自己释放 context（流式路径由 streamFromUpstream 的 defer 负责）。
-	err = nonStreamFromUpstream(state, ctx, rt, session, convert, to, auditID, w, start, status, respHeadersJSON, resp.Body)
+	err = nonStreamFromUpstream(state, rt, hop, auditID, w, start, status, respHeadersJSON, resp.Body)
 	cancel()
 	return err
 }
 
 // buildUpstreamBody 计算发往上游的请求体：透传只替换 model，转换走协议映射。
-func buildUpstreamBody(ctx *RequestContext, rt Route, session *converter.Session, to converter.ApiFormat, convert bool) ([]byte, error) {
-	if !convert {
+func buildUpstreamBody(ctx *RequestContext, rt Route, hop *converter.Hop) ([]byte, error) {
+	if !hop.Converts() {
 		return ReplaceModelInJSON(ctx.RawBody, rt.ActualModel), nil
 	}
 	if ctx.Format == converter.FormatResponses {
@@ -168,7 +169,7 @@ func buildUpstreamBody(ctx *RequestContext, rt Route, session *converter.Session
 	}
 	// 说明：Rust/model-bridge 没有「模型是否支持图片」的能力表，因此这里不做图像闸门，
 	// 与重写前行为一致（ocgo 的图像校验依赖其自带的模型元数据，本仓库无此数据源）。
-	out, err := session.BuildUpstreamRequest(ctx.Format, to, ctx.RawBody, converter.RequestOptions{
+	out, err := hop.BuildUpstreamRequest(ctx.RawBody, converter.RequestOptions{
 		Model:          rt.ActualModel,
 		Stream:         ctx.IsStream,
 		SupportsImages: true,
@@ -197,8 +198,8 @@ func buildUpstreamHeaders(ctx *RequestContext, ch *config.ChannelConfig) map[str
 
 // nonStreamFromUpstream 处理非流式响应：读全量 → 转回入口协议 → 落审计 → 回写。
 func nonStreamFromUpstream(
-	state *app.State, ctx *RequestContext, rt Route, session *converter.Session, convert bool,
-	to converter.ApiFormat, auditID int64, w http.ResponseWriter, start time.Time,
+	state *app.State, rt Route, hop *converter.Hop,
+	auditID int64, w http.ResponseWriter, start time.Time,
 	status int, respHeadersJSON string, body io.Reader,
 ) error {
 	raw, err := io.ReadAll(body)
@@ -221,10 +222,8 @@ func nonStreamFromUpstream(
 	cost := computeCost(state, rt.ActualModel, tokens)
 
 	responseBody := rawText
-	if convert {
-		// 注意方向：转换器以「上游格式 → 下游格式」为参数顺序，
-		// 上游永远是 Chat（本仓库矩阵里唯一的转换枢纽），下游才是入口协议。
-		if converted, err := session.ConvertNonStreamResponse(to, ctx.Format, raw, rt.ActualModel); err == nil {
+	if hop.Converts() {
+		if converted, err := hop.NonStreamResponse(raw, rt.ActualModel); err == nil {
 			responseBody = string(converted)
 		}
 	}
@@ -245,9 +244,7 @@ type streamArgs struct {
 	state           *app.State
 	ctx             *RequestContext
 	rt              Route
-	session         *converter.Session
-	convert         bool
-	to              converter.ApiFormat
+	hop             *converter.Hop
 	auditID         int64
 	w               http.ResponseWriter
 	start           time.Time
@@ -268,20 +265,20 @@ func streamFromUpstream(a streamArgs) error {
 	// 降级一：跨格式转换路径下，上游对流式请求返回了非 SSE 的完整 JSON
 	// （常见于带工具调用的场景）。按 SSE 解析的转换器无法处理，
 	// 这里读全量、转换后重放为入口协议的 SSE 事件流。
-	if a.convert && !upstreamIsSSE {
+	if a.hop.Converts() && !upstreamIsSSE {
 		raw, err := io.ReadAll(a.body)
 		if err != nil {
 			return fmt.Errorf("read response failed: %s", err)
 		}
 		if a.status < 400 {
-			// 方向同上：上游格式（chat）→ 下游格式（入口协议）。
-			if sse, err := a.session.FullResponseToSSE(a.to, a.ctx.Format, raw, a.rt.ActualModel); err == nil && len(sse) > 0 {
+			// 上游把流式请求当成非流式回了：整段响应重放为入口协议的 SSE。
+			if sse, err := a.hop.ReplayResponseAsSSE(raw, a.rt.ActualModel); err == nil && len(sse) > 0 {
 				var tokens audit.TokenUsage
 				var convertedText string
 				if obj := decodeObject(raw); obj != nil {
 					tokens = audit.ExtractTokensFromJSON(obj)
 				}
-				if converted, err := a.session.ConvertNonStreamResponse(a.to, a.ctx.Format, raw, a.rt.ActualModel); err == nil {
+				if converted, err := a.hop.NonStreamResponse(raw, a.rt.ActualModel); err == nil {
 					convertedText = strings.TrimSpace(PrettyJSON(string(converted)))
 				} else {
 					convertedText = string(sse)
@@ -342,9 +339,8 @@ func streamFromUpstream(a streamArgs) error {
 	writeSSEHeaders(a.w, http.StatusOK)
 	flushWriter(a.w)
 
-	if a.convert {
-		// 方向：上游格式（chat）→ 下游格式（入口协议）。
-		_, err = a.session.ConvertStreamResponse(a.to, a.ctx.Format, upstreamReader, sink, a.rt.ActualModel, func() {
+	if a.hop.Converts() {
+		_, err = a.hop.StreamResponse(upstreamReader, sink, a.rt.ActualModel, func() {
 			flushWriter(a.w)
 		})
 		if err != nil {
@@ -357,7 +353,7 @@ func streamFromUpstream(a streamArgs) error {
 
 	rawText := collected.String()
 	var forwardedPtr *string
-	if a.convert {
+	if a.hop.Converts() {
 		forwardedText := forwarded.String()
 		forwardedPtr = &forwardedText
 	}

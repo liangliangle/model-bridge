@@ -9,7 +9,9 @@ import (
 
 	"modelbridge/internal/app"
 	"modelbridge/internal/audit"
+	"modelbridge/internal/auth"
 	"modelbridge/internal/config"
+	"modelbridge/internal/mcp"
 )
 
 // ---------- /api/auth/status ----------
@@ -26,7 +28,7 @@ func handleAuthStatus(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		adminToken := state.Config().Auth.AdminToken
 		required := adminToken != nil && *adminToken != ""
-		valid := !required || adminAuthOK(state, r)
+		valid := !required || auth.AdminOK(state, r)
 		writeOK(w, authStatusResp{Required: required, Valid: valid})
 	}
 }
@@ -37,7 +39,7 @@ func handleAuthStatus(state *app.State) http.HandlerFunc {
 // 查询参数 period（缺省 today）与 channel（可选）→ 统计概览。
 func handleStats(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		q := r.URL.Query()
@@ -65,7 +67,7 @@ func handleStats(state *app.State) http.HandlerFunc {
 // 按天聚合 token 用量，days 缺省 91。
 func handleTokenHeatmap(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		days := uint32(91)
@@ -92,7 +94,7 @@ func handleTokenHeatmap(state *app.State) http.HandlerFunc {
 // path_filter / time_from / time_to / limit（默认 100）。
 func handleAuditLogs(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		q := r.URL.Query()
@@ -127,7 +129,7 @@ func handleAuditLogs(state *app.State) http.HandlerFunc {
 // `?id=<i64>`，不存在时返回 `{"error":"Not found"}`（HTTP 200）。
 func handleAuditDetail(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		raw := r.URL.Query().Get("id")
@@ -157,7 +159,7 @@ func handleAuditDetail(state *app.State) http.HandlerFunc {
 // 审计库概况 `{size_bytes, total_records, detail_records}`。
 func handleAuditDBStatus(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		st, err := state.Audit.Status()
@@ -187,7 +189,7 @@ type channelInfo struct {
 // handleChannels 对应 Rust `get_channels`（commands.rs:246）：渠道简略列表。
 func handleChannels(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		cfg := state.Config()
@@ -232,7 +234,7 @@ type channelHealthInfo struct {
 // 按已启用渠道（优先级升序）返回熔断状态机状态 + 该 period 窗口内的 DB 统计。
 func handleChannelHealth(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		period := r.URL.Query().Get("period")
@@ -441,7 +443,7 @@ type configViewData struct {
 // 完整配置（含渠道 API Key、MCP server、模型价格以外的全部可编辑字段）。
 func handleFullConfig(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		cfg := state.Config()
@@ -529,13 +531,13 @@ func retentionDays(cfg *config.AppConfig) uint32 {
 
 // handleMCPOAuthStatus 对应 Rust `get_mcp_oauth_status`（commands.rs:640）：
 // `?serverId=<id>` → `{authorized, expiresAt, needsReauth}`。
-func handleMCPOAuthStatus(state *app.State) http.HandlerFunc {
+func handleMCPOAuthStatus(state *app.State, mcpState *mcp.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		serverID := r.URL.Query().Get("serverId")
-		info := MCPSession(state).OAuthStatus(serverID)
+		info := mcpState.OAuthStatus(serverID)
 		writeOK(w, info)
 	}
 }
@@ -558,7 +560,7 @@ type modelPriceView struct {
 // handleModelPrices 对应 Rust `get_model_prices`（commands.rs:828）：全部模型定价。
 func handleModelPrices(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		prices := state.Config().ModelPrices

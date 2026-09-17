@@ -20,7 +20,7 @@
 //  1. cache_control 在两个方向都保留（不移植 ocgo 的 stripCacheControl）；
 //  2. 非流式 Anthropic 形态响应必须带 tool_use 块（不沿用 ocgo 丢弃 tool_calls 的写法）；
 //  3. Responses 的 item 生命周期与「response.completed 必带 usage 对象」；
-//  4. namespace 展平 + custom 工具往返（靠 Session 状态）；
+//  4. namespace 展平 + custom 工具往返（靠 session 状态）；
 //  5. 流式收尾推迟到 [DONE]/EOF，以携带上游真实 usage（不写死 0）；
 //  6. custom_tool_call 输出项 + unwrap_custom_tool_arguments。
 //
@@ -31,6 +31,8 @@ package converter
 import (
 	"io"
 	"strings"
+
+	"modelbridge/internal/sse"
 )
 
 // ApiFormat 是三套协议的统一格式标识（对应 Rust converter/mod.rs::ApiFormat）。
@@ -115,25 +117,28 @@ type RequestOptions struct {
 	SupportsImages bool
 }
 
-// Session 承载一次代理请求的转换状态：namespace/custom 工具的反向映射在转换
-// **请求**时写入，转换**响应**或流式时读回。每个被代理的请求创建一个 Session，
-// 请求与响应两个方向共用同一个实例。Session 不保证并发安全。
+// session 承载一次代理请求的转换状态：namespace/custom 工具的反向映射在转换
+// **请求**时写入，转换**响应**或流式时读回。请求与响应两个方向共用同一个实例，
+// 由 Hop 持有（见 hop.go）。session 不保证并发安全。
+//
+// 四个方法的参数都是「源格式 → 目标格式」，请求方向与响应方向正好相反；同型参数
+// 可互换正是 hop.go 要消除的隐患，因此这些方法**不导出**，外部一律走 Hop。
 //
 // 对应 Rust converter/mod.rs::FormatConverter 中的 ns_reverse。
-type Session struct {
+type convSession struct {
 	// nsReverse: flat_name → (namespace_name, subtool_name)。
 	// custom 工具的 namespace 位置存放 CUSTOM_TOOL_NAMESPACE_MARKER。
 	nsReverse map[string]nsEntry
 }
 
-// NewSession 创建一个空的转换 Session。
-func NewSession() *Session {
-	return &Session{nsReverse: map[string]nsEntry{}}
+// newConvSession 创建一个空的转换会话状态。
+func newConvSession() *convSession {
+	return &convSession{nsReverse: map[string]nsEntry{}}
 }
 
-// BuildUpstreamRequest 把下游请求体（in 格式）转换为上游请求体（out 格式）。
+// buildUpstreamRequest 把下游请求体（in 格式）转换为上游请求体（out 格式）。
 // 仅支持 messages->chat 与 responses->chat；其它组合返回 *UnsupportedConversion。
-func (s *Session) BuildUpstreamRequest(in, out ApiFormat, body []byte, opts RequestOptions) ([]byte, error) {
+func (s *convSession) buildUpstreamRequest(in, out ApiFormat, body []byte, opts RequestOptions) ([]byte, error) {
 	if out != FormatOpenAIChat || (in != FormatAnthropic && in != FormatResponses) {
 		return nil, &UnsupportedConversion{From: in, To: out}
 	}
@@ -153,9 +158,9 @@ func (s *Session) BuildUpstreamRequest(in, out ApiFormat, body []byte, opts Requ
 	return finalizeChatRequest(converted, opts)
 }
 
-// ConvertNonStreamResponse 把上游非流式响应体（in 格式）转换为下游响应体（out 格式）。
+// convertNonStreamResponse 把上游非流式响应体（in 格式）转换为下游响应体（out 格式）。
 // 仅支持 chat->messages 与 chat->responses；其它组合返回 *UnsupportedConversion。
-func (s *Session) ConvertNonStreamResponse(in, out ApiFormat, body []byte, model string) ([]byte, error) {
+func (s *convSession) convertNonStreamResponse(in, out ApiFormat, body []byte, model string) ([]byte, error) {
 	if in != FormatOpenAIChat || (out != FormatAnthropic && out != FormatResponses) {
 		return nil, &UnsupportedConversion{From: in, To: out}
 	}
@@ -173,12 +178,12 @@ func (s *Session) ConvertNonStreamResponse(in, out ApiFormat, body []byte, model
 	return marshalJSON(converted)
 }
 
-// ConvertStreamResponse 读取 in 格式的上游 SSE（r），写出 out 格式的下游 SSE（w）。
+// convertStreamResponse 读取 in 格式的上游 SSE（r），写出 out 格式的下游 SSE（w）。
 // flush 非 nil 时，每写出一个下游事件后调用一次。
 // 返回累计观察到的**上游** usage（Anthropic 口径，缓存命中单列，见 Usage）。
 //
 // 仅支持 chat->messages 与 chat->responses（上游永远是中枢 Chat）。
-func (s *Session) ConvertStreamResponse(in, out ApiFormat, r io.Reader, w io.Writer, model string, flush func()) (Usage, error) {
+func (s *convSession) convertStreamResponse(in, out ApiFormat, r io.Reader, w io.Writer, model string, flush func()) (Usage, error) {
 	if in != FormatOpenAIChat || (out != FormatAnthropic && out != FormatResponses) {
 		return Usage{}, &UnsupportedConversion{From: in, To: out}
 	}
@@ -199,7 +204,7 @@ func (s *Session) ConvertStreamResponse(in, out ApiFormat, r io.Reader, w io.Wri
 		}
 		return nil
 	}
-	err := scanSSE(r, func(ev sseEvent) error {
+	err := sse.Scan(r, func(ev sse.Event) error {
 		return writeAll(conv.processEvent(ev))
 	})
 	if err != nil {
@@ -211,18 +216,18 @@ func (s *Session) ConvertStreamResponse(in, out ApiFormat, r io.Reader, w io.Wri
 	return conv.usage(), nil
 }
 
-// FullResponseToSSE 把上游**完整的非 SSE JSON 响应**（in 格式）重放成下游 SSE 事件流（out 格式）。
+// fullResponseToSSE 把上游**完整的非 SSE JSON 响应**（in 格式）重放成下游 SSE 事件流（out 格式）。
 // 代理在上游对「流式请求」返回了单个 JSON 体时使用它。
 //
 // in != out 时先走 ConvertNonStreamResponse（受同一矩阵约束）；in == out 时不做转换，
 // 仅按该入口格式重放（这不是协议转换，矩阵未被放宽）。
-func (s *Session) FullResponseToSSE(in, out ApiFormat, body []byte, model string) ([]byte, error) {
+func (s *convSession) fullResponseToSSE(in, out ApiFormat, body []byte, model string) ([]byte, error) {
 	resp, err := decodeObject(body)
 	if err != nil {
 		return nil, err
 	}
 	if in != out {
-		converted, err := s.ConvertNonStreamResponse(in, out, body, model)
+		converted, err := s.convertNonStreamResponse(in, out, body, model)
 		if err != nil {
 			return nil, err
 		}

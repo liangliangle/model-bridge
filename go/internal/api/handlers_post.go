@@ -18,6 +18,7 @@ import (
 
 	"modelbridge/internal/app"
 	"modelbridge/internal/audit"
+	"modelbridge/internal/auth"
 	"modelbridge/internal/config"
 	"modelbridge/internal/mcp"
 )
@@ -28,7 +29,7 @@ import (
 // 删除超期记录（保留天数取配置，0 = 永久留存则跳过）+ 详情只保留最近 1000 条 + VACUUM。
 func handleForceCleanupAudit(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		retention := retentionDays(state.Config())
@@ -85,7 +86,7 @@ func parseProvider(s string) (config.ProviderType, error) {
 // 按 id upsert（存在则整体替换），并为该渠道补建健康记录；失败返回 {"error": …}。
 func handleSaveChannel(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		var req channelSaveReq
@@ -158,7 +159,7 @@ type deleteChannelReq struct {
 // 按 id 删除渠道，并移除该渠道的健康记录，然后落盘。
 func handleDeleteChannel(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		var req deleteChannelReq
@@ -200,7 +201,7 @@ type failoverSaveReq struct {
 // handleSaveFailover 对应 Rust `save_failover_config`（commands.rs:653）。
 func handleSaveFailover(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		var req failoverSaveReq
@@ -271,7 +272,7 @@ type settingsSaveReq struct {
 // 端口 / host / public_url / 模型列表 / 鉴权 / 最终兜底渠道 / 审计保留天数。
 func handleSaveSettings(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		var req settingsSaveReq
@@ -297,7 +298,7 @@ func handleSaveSettings(state *app.State) http.HandlerFunc {
 			cfg.PublicURL = filterEmpty(req.PublicURL)
 			cfg.Models = nonNilSlice(*req.Models)
 			if req.Auth != nil {
-				// Rust 这里不做空串过滤，原样写入（admin_token 为空串时 adminAuthOK 视为免鉴权）。
+				// Rust 这里不做空串过滤，原样写入（admin_token 为空串时视为免鉴权）。
 				cfg.Auth = config.AuthConfig{
 					ProxyTokens: nonNilSlice(req.Auth.ProxyTokens),
 					AdminToken:  req.Auth.AdminToken,
@@ -350,7 +351,7 @@ const testChannelTimeout = 15 * time.Second
 // 真发一次请求，返回 `{success, status_code, latency_ms, response_body}`。
 func handleTestChannel(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		raw, ok := readBody(w, r)
@@ -460,7 +461,7 @@ type mcpSaveReq struct {
 // 按 id upsert；更新时保留已有 oauth 授权数据，新增时 oauth = None、cached_tools = []。
 func handleSaveMCPServer(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		var req mcpSaveReq
@@ -518,7 +519,7 @@ type deleteMCPServerReq struct {
 // handleDeleteMCPServer 对应 Rust `delete_mcp_server`（commands.rs:519）。
 func handleDeleteMCPServer(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		var req deleteMCPServerReq
@@ -552,9 +553,9 @@ type mcpServerIDReq struct {
 
 // handleFetchMCPTools 对应 Rust `fetch_mcp_tools`（commands.rs:546）：
 // 按 id 直接查（不带 enabled 过滤）→ 握手拉取工具并写入 cached_tools → 落盘。
-func handleFetchMCPTools(state *app.State) http.HandlerFunc {
+func handleFetchMCPTools(state *app.State, mcpState *mcp.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		var req mcpServerIDReq
@@ -575,7 +576,7 @@ func handleFetchMCPTools(state *app.State) http.HandlerFunc {
 			return
 		}
 
-		tools, err := mcp.FetchTools(r.Context(), MCPSession(state), server)
+		tools, err := mcp.FetchTools(r.Context(), mcpState, server)
 		if err != nil {
 			var fetchErr *mcp.FetchToolsError
 			if errors.As(err, &fetchErr) && fetchErr.Kind == mcp.FetchToolsNeedsAuth {
@@ -622,7 +623,7 @@ type toggleToolReq struct {
 // 启用 = 从 blocked_tools 移除；禁用 = 加入 blocked_tools（去重）。
 func handleToggleMCPTool(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		var req toggleToolReq
@@ -678,16 +679,16 @@ func containsString(list []string, v string) bool {
 
 // handleStartMCPOAuth 对应 Rust `start_mcp_oauth`（commands.rs:621）：
 // 触发 OAuth 2.1 授权流程，返回 `{authorizeUrl}` 供前端打开。
-func handleStartMCPOAuth(state *app.State) http.HandlerFunc {
+func handleStartMCPOAuth(state *app.State, mcpState *mcp.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		var req mcpServerIDReq
 		if !decodeBody(w, r, &req) {
 			return
 		}
-		url, err := MCPSession(state).StartOAuthFlow(r.Context(), req.ServerID)
+		url, err := mcpState.StartOAuthFlow(r.Context(), req.ServerID)
 		if err != nil {
 			log.Printf("api: start_mcp_oauth 失败: %v", err)
 			writeAPIError(w, http.StatusOK, err.Error())
@@ -716,7 +717,7 @@ type modelPriceSaveReq struct {
 // 模型名去空格后非空校验 + 按 model upsert。
 func handleSaveModelPrice(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		var req modelPriceSaveReq
@@ -767,7 +768,7 @@ type deleteModelPriceReq struct {
 // handleDeleteModelPrice 对应 Rust `delete_model_price`（commands.rs:892）。
 func handleDeleteModelPrice(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !requireAdmin(w, r, state) {
+		if !auth.RequireAdmin(w, r, state) {
 			return
 		}
 		var req deleteModelPriceReq

@@ -22,7 +22,7 @@ import (
 //
 //  1. cache_control 全程保留：不移植 ocgo 的 stripCacheControl（~1348），也不调用它；
 //  2. 出站 stream / stream_options 由 RequestOptions.Stream 决定（规则 2）；
-//  3. namespace / custom 工具展平写满 Session.nsReverse（规则 3）；
+//  3. namespace / custom 工具展平写满 session.nsReverse（规则 3）；
 //  4. RequestOptions.Model 非空时覆盖出站 model（规则 4）。
 //
 // 未移植的 ocgo 片段及原因（避免死代码）：
@@ -46,7 +46,7 @@ const (
 	unavailableToolResultContent = "Tool result unavailable."
 )
 
-// errNilSession 表示在 nil Session 上做 Responses 转换（需要 nsReverse 状态）。
+// errNilSession 表示在 nil session 上做 Responses 转换（需要 nsReverse 状态）。
 var errNilSession = errors.New("converter: responsesToChat requires a session")
 
 // ==================== Messages 请求 → Chat 请求 ====================
@@ -636,7 +636,7 @@ func blockText(v any) string {
 //
 // 与 ocgo 的差异：内建工具不再落成 Anthropic 形态（responseBuiltinToolToAnthropic），
 // 而是按规则 6 落成 Chat function 工具；reasoning 项保留成 reasoning_content。
-func (s *Session) responsesToChat(req map[string]any, opts RequestOptions) (map[string]any, error) {
+func (s *convSession) responsesToChat(req map[string]any, opts RequestOptions) (map[string]any, error) {
 	if req == nil {
 		return nil, errNotObject
 	}
@@ -644,7 +644,7 @@ func (s *Session) responsesToChat(req map[string]any, opts RequestOptions) (map[
 		return nil, errNilSession
 	}
 	if s.nsReverse == nil {
-		// 零值 Session 也要能用：否则 registerCustomTool/flattenNamespaceSubtool 会写 nil map。
+		// 零值 session 也要能用：否则 registerCustomTool/flattenNamespaceSubtool 会写 nil map。
 		s.nsReverse = map[string]nsEntry{}
 	}
 

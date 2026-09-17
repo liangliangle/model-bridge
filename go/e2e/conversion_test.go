@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"modelbridge/internal/config"
+	"modelbridge/internal/sse"
 )
 
 // ==================== 非流式 ====================
@@ -458,7 +459,7 @@ func TestStreamChatEntry(t *testing.T) {
 
 // ==================== 事件解析小工具 ====================
 
-func anthropicStreamText(t *testing.T, events []sseEvent) string {
+func anthropicStreamText(t *testing.T, events []sse.Event) string {
 	t.Helper()
 	var sb strings.Builder
 	for _, ev := range events {
@@ -478,7 +479,7 @@ func anthropicStreamText(t *testing.T, events []sseEvent) string {
 }
 
 // anthropicStreamStartHasUsage 断言 message_start.message.usage 存在且带必需字段。
-func anthropicStreamStartHasUsage(t *testing.T, events []sseEvent) bool {
+func anthropicStreamStartHasUsage(t *testing.T, events []sse.Event) bool {
 	t.Helper()
 	for _, ev := range events {
 		var payload map[string]any
@@ -500,7 +501,7 @@ func anthropicStreamStartHasUsage(t *testing.T, events []sseEvent) bool {
 }
 
 // anthropicStreamDeltaUsage 返回 message_delta 的累计 usage。
-func anthropicStreamDeltaUsage(t *testing.T, events []sseEvent) map[string]any {
+func anthropicStreamDeltaUsage(t *testing.T, events []sse.Event) map[string]any {
 	t.Helper()
 	for _, ev := range events {
 		var payload map[string]any
@@ -519,7 +520,7 @@ func anthropicStreamDeltaUsage(t *testing.T, events []sseEvent) map[string]any {
 }
 
 // responsesStreamSummary 汇总 Responses 事件流：增量文本 + 终态 usage。
-func responsesStreamSummary(t *testing.T, events []sseEvent) (string, map[string]any) {
+func responsesStreamSummary(t *testing.T, events []sse.Event) (string, map[string]any) {
 	t.Helper()
 	var sb strings.Builder
 	var usage map[string]any
@@ -543,7 +544,7 @@ func responsesStreamSummary(t *testing.T, events []sseEvent) (string, map[string
 	return sb.String(), usage
 }
 
-func chatStreamText(t *testing.T, events []sseEvent) string {
+func chatStreamText(t *testing.T, events []sse.Event) string {
 	t.Helper()
 	var sb strings.Builder
 	for _, ev := range events {

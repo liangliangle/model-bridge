@@ -3,7 +3,7 @@ package converter
 // 本文件实现**非流式响应方向**的两条单跳转换：
 //
 //	chat → messages ：openAIToAnthropicResponse
-//	chat → responses：(*Session).toResponsesWithNS
+//	chat → responses：(*convSession).toResponsesWithNS
 //
 // 纯映射机制逐行对照 ocgo cmd/ocgo/main.go（writeAnthropicResponse line 2607、
 // writeResponsesResponse line 3048），协议契约以 Rust converter/response.rs 为准：
@@ -11,7 +11,7 @@ package converter
 //  1. 非流式 Anthropic 形态必须保留工具调用（`tool_use` 内容块 + `stop_reason: tool_use`），
 //     不沿用 ocgo 丢弃 tool_calls 的写法（见 converter.go 顶部「两者冲突时以 Rust 契约为准」第 2 条）；
 //  2. Responses 形态必须是完整的 response 对象（item 生命周期 + usage）；
-//  3. custom / namespace 工具用 Session.nsReverse 还原（custom_tool_call 输出项 + 参数解壳）。
+//  3. custom / namespace 工具用 session.nsReverse 还原（custom_tool_call 输出项 + 参数解壳）。
 
 // firstChatChoice 取 Chat 响应的 choices[0]；缺失、非数组或元素非对象时返回 nil。
 // 对应 Rust response.rs 里 `resp.get("choices").and_then(as_array).and_then(first)` 的取值链。
@@ -121,7 +121,7 @@ func openAIToAnthropicResponse(resp map[string]any, model string) map[string]any
 // 对应 Rust response.rs::to_responses_with_ns（line 26）与 chat_resp_to_responses_with_ns（line 44），
 // 同时对照 ocgo main.go::writeResponsesResponse（line 3048）的工具项构造。
 // item 生命周期（message / function_call / custom_tool_call）以 Rust 为准。
-func (s *Session) toResponsesWithNS(resp map[string]any, model string) map[string]any {
+func (s *convSession) toResponsesWithNS(resp map[string]any, model string) map[string]any {
 	choice := firstChatChoice(resp)
 	var message map[string]any
 	finishReason := ""

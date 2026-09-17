@@ -284,7 +284,7 @@ func TestToResponsesWithNS(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			session := NewSession()
+			session := newConvSession()
 			resp := mustObject(t, tc.raw)
 			out := session.toResponsesWithNS(resp, "gpt-4o")
 
@@ -321,7 +321,7 @@ func TestToResponsesWithNS(t *testing.T) {
 }
 
 func TestToResponsesWithNSUsageConvention(t *testing.T) {
-	session := NewSession()
+	session := newConvSession()
 	resp := mustObject(t, `{
 		"id": "chatcmpl-1",
 		"choices": [{"index": 0, "message": {"content": "hi"}, "finish_reason": "stop"}],
@@ -353,7 +353,7 @@ func TestToResponsesWithNSUsageConvention(t *testing.T) {
 }
 
 func TestToResponsesWithNSCustomToolRoundTrip(t *testing.T) {
-	session := NewSession()
+	session := newConvSession()
 	// 请求方向会把 custom 工具登记为「namespace 位置 = MARKER，subtool = 原名」。
 	registerCustomTool("exec", session.nsReverse)
 
@@ -394,7 +394,7 @@ func TestToResponsesWithNSCustomToolRoundTrip(t *testing.T) {
 }
 
 func TestToResponsesWithNSNamespaceRestore(t *testing.T) {
-	session := NewSession()
+	session := newConvSession()
 	// 请求方向：namespace 子工具被展平成 `<ns>__<sub>` 并登记反向映射。
 	flat, ok := flattenNamespaceSubtool("mcp__tools", map[string]any{
 		"name":       "sub_a",
@@ -442,7 +442,7 @@ func TestToResponsesWithNSNamespaceRestore(t *testing.T) {
 }
 
 func TestToResponsesWithNSReasoningPart(t *testing.T) {
-	session := NewSession()
+	session := newConvSession()
 	resp := mustObject(t, `{
 		"id": "chatcmpl-1",
 		"choices": [{
@@ -487,7 +487,7 @@ func TestToResponsesWithNSReasoningPart(t *testing.T) {
 // ==================== 门面（facade）端到端 ====================
 
 func TestConvertNonStreamResponseFacade(t *testing.T) {
-	session := NewSession()
+	session := newConvSession()
 	body := []byte(`{
 		"id": "chatcmpl-9",
 		"choices": [{
@@ -503,7 +503,7 @@ func TestConvertNonStreamResponseFacade(t *testing.T) {
 		"usage": {"prompt_tokens": 7, "completion_tokens": 3}
 	}`)
 
-	rawMessages, err := session.ConvertNonStreamResponse(FormatOpenAIChat, FormatAnthropic, body, "m")
+	rawMessages, err := session.convertNonStreamResponse(FormatOpenAIChat, FormatAnthropic, body, "m")
 	if err != nil {
 		t.Fatalf("ConvertNonStreamResponse(->messages): %v", err)
 	}
@@ -515,7 +515,7 @@ func TestConvertNonStreamResponseFacade(t *testing.T) {
 		t.Fatalf("messages content = %v", types)
 	}
 
-	rawResponses, err := session.ConvertNonStreamResponse(FormatOpenAIChat, FormatResponses, body, "m")
+	rawResponses, err := session.convertNonStreamResponse(FormatOpenAIChat, FormatResponses, body, "m")
 	if err != nil {
 		t.Fatalf("ConvertNonStreamResponse(->responses): %v", err)
 	}
@@ -536,7 +536,7 @@ func TestConvertNonStreamResponseFacade(t *testing.T) {
 	}
 
 	// 矩阵外的组合必须报错。
-	if _, err := session.ConvertNonStreamResponse(FormatAnthropic, FormatResponses, body, "m"); err == nil {
+	if _, err := session.convertNonStreamResponse(FormatAnthropic, FormatResponses, body, "m"); err == nil {
 		t.Fatalf("messages → responses 必须返回 *UnsupportedConversion")
 	} else if _, ok := err.(*UnsupportedConversion); !ok {
 		t.Fatalf("错误类型 = %T, want *UnsupportedConversion", err)

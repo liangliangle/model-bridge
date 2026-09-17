@@ -51,10 +51,23 @@ Invariants:
 
 - `src/` — React 18 frontend (TypeScript, Tailwind CSS, Vite)
 - `go/` — Go backend (module `modelbridge`)
-  - `cmd/model-bridge/` — entry point: config load, audit DB, health checker, HTTP listen
-  - `internal/converter/` — protocol conversion (largest module; see the matrix above)
-  - `internal/proxy/` — `server.go` (routes), `router.go` (selection, audit, failover loop),
-    `executor.go` (per-channel execution, streaming error detection), `context.go`
+  - `cmd/model-bridge/` — entry point: config load, startup self-checks, audit DB, health
+    checker, HTTP listen. **It is the composition root**: it builds the `mux`, registers
+    `proxy.Register` (`/v1/*`), `api.Register` (`/api/*`), `mcp.Register` (`/mcp/*`,
+    `/oauth/callback`) and the embedded frontend, then wraps it with `proxy.Middleware`. Library
+    packages never import each other's routers (`proxy` does not import `api`).
+  - `internal/converter/` — protocol conversion (largest module; see the matrix above).
+    `hop.go` is the only exported entry point: build one `Hop` per request from
+    `client.AsClient()` + `channel.AsChannel()`, then use it for **both** the request and the
+    response direction. It exists because the inner methods take a swappable `(source, target)`
+    `ApiFormat` pair, which is how the request direction once got inverted silently.
+  - `internal/proxy/` — `server.go` (routes, middleware, `/v1/models`), `router.go` (selection,
+    audit, failover loop), `executor.go` (per-channel execution, streaming error detection),
+    `context.go`
+  - `internal/auth/` — the single definition of both auth rules (`admin_token` for `/api/*`,
+    `proxy_tokens` for `/v1/*`) and of the Rust-shaped 401 body
+  - `internal/sse/` — the single SSE framing/parsing implementation (`Scan`, `Data`, `Done`)
+    used by the converter, the audit assembler, the stream error probe and the e2e helpers
   - `internal/channel/` — health tracking / circuit breaker, `failover.go` routing
   - `internal/audit/` — SQLite audit log; `assemble.go` rebuilds a readable response object
     from a raw SSE stream for the detail view
@@ -106,17 +119,20 @@ RAM and parallel compilation gets OOM-killed.
 
 | Package | Covers |
 |---|---|
-| `internal/converter` | request/response/stream mapping for both directions, namespace round-trip, SSE framing at every byte offset |
+| `internal/converter` | request/response/stream mapping for both directions, namespace round-trip, SSE framing at every byte offset, `Hop` direction/regression |
 | `internal/channel` | protocol-matrix filtering, priority ordering, candidate cap, circuit breaker |
+| `internal/auth` | admin/proxy token rules and the exact 401 body |
+| `internal/config` | config save/merge (comments, unknown keys, 0600, atomic) and the exposure self-check |
 | `internal/audit` | rebuilding a readable response object from raw SSE (Anthropic / Chat / Responses) |
 | `internal/api` | every admin endpoint against a real config file and a real SQLite DB |
 | `e2e` | the real HTTP server driven by a mock upstream: non-stream and stream for all three entries, failover ordering, MCP tool filtering, audit/cost persistence |
 
 Guidelines:
 
-- `e2e` tests must exercise the real path — build the app with `proxy.NewServer`, point channels at
-  the mock upstream, and assert on the bytes that reach the upstream and the bytes sent downstream.
-  Do not assert on internals or hardcode expected values that restate the implementation.
+- `e2e` tests must exercise the real path — assemble the app exactly like `cmd/model-bridge` does
+  (see `newBackend` in `e2e/e2e_test.go`), point channels at the mock upstream, and assert on the
+  bytes that reach the upstream and the bytes sent downstream. Do not assert on internals or
+  hardcode expected values that restate the implementation.
 - Evidence goes to the directory named by `$SCRATCH`; tests skip evidence writes when it is unset
   but still run every assertion.
 - `mock_upstream.go` answers in all three protocols and records every request, so a test can prove
@@ -136,3 +152,14 @@ available options. Never commit real API keys or secrets.
 - `failover.max_failover_channels` caps how many channels any single request may try; `0` means
   unlimited. It is **not** a retry count — per-channel retries are `channels[].retry_count`.
   The legacy key `max_retries` still loads as a serde alias; serialization writes the new name.
+- **Saving is a document merge, not a rewrite.** `SaveToFile` parses the file on disk into a YAML
+  node tree and merges the in-memory config into it, so comments, key order and hand-written
+  unknown keys survive; only changed values are replaced in place. It writes through a temp file +
+  `rename` and always ends up `0600` (the file holds API keys and the admin token). A file that
+  cannot be parsed is *not* truncated — the merge is skipped, a warning is logged, and a fresh
+  document is written. Keep it that way: `internal/config/save_test.go` asserts the raw bytes.
+- **Exposure self-check on startup.** When `listen_host` is not loopback (`0.0.0.0`, a LAN/public
+  IP, or empty) the server logs a `WARNING:` block naming which surfaces have no auth:
+  `/api/*` without `auth.admin_token`, `/v1/*` without `auth.proxy_tokens`, and `/mcp/*` (which
+  never checks a token, matching the previous behavior). Set `MODEL_BRIDGE_REQUIRE_AUTH=1` to turn
+  those warnings into a refusal to start. Loopback default `127.0.0.1` stays silent.

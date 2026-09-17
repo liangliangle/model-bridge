@@ -18,8 +18,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strings"
-	"sync"
 
 	"modelbridge/internal/app"
 	"modelbridge/internal/mcp"
@@ -30,9 +28,13 @@ const maxBodyBytes = 64 << 20
 
 // Register 注册全部 /api/* 管理端点。
 //
+// mcpState 由调用方（cmd/model-bridge）构造并与 mcp 中继共用同一实例：OAuth 的
+// pending 表必须由 oauth/start 写入、由 /oauth/callback 读回，两份 store 会让授权
+// 回调永远无法命中。
+//
 // 对应 Rust `proxy/server.rs` 里的路由表：GET 11 条 + POST 13 条，其中
 // /api/model-prices 同时注册 GET（get_model_prices）与 POST（save_model_price）。
-func Register(mux *http.ServeMux, state *app.State) {
+func Register(mux *http.ServeMux, state *app.State, mcpState *mcp.State) {
 	// ===== GET =====
 	mux.HandleFunc("GET /api/auth/status", handleAuthStatus(state))
 	mux.HandleFunc("GET /api/stats", handleStats(state))
@@ -43,7 +45,7 @@ func Register(mux *http.ServeMux, state *app.State) {
 	mux.HandleFunc("GET /api/channels", handleChannels(state))
 	mux.HandleFunc("GET /api/channels/health", handleChannelHealth(state))
 	mux.HandleFunc("GET /api/config", handleFullConfig(state))
-	mux.HandleFunc("GET /api/config/mcp/oauth/status", handleMCPOAuthStatus(state))
+	mux.HandleFunc("GET /api/config/mcp/oauth/status", handleMCPOAuthStatus(state, mcpState))
 	mux.HandleFunc("GET /api/model-prices", handleModelPrices(state))
 
 	// ===== POST =====
@@ -55,46 +57,11 @@ func Register(mux *http.ServeMux, state *app.State) {
 	mux.HandleFunc("POST /api/config/channel/test", handleTestChannel(state))
 	mux.HandleFunc("POST /api/config/mcp", handleSaveMCPServer(state))
 	mux.HandleFunc("POST /api/config/mcp/delete", handleDeleteMCPServer(state))
-	mux.HandleFunc("POST /api/config/mcp/oauth/start", handleStartMCPOAuth(state))
-	mux.HandleFunc("POST /api/config/mcp/tools/fetch", handleFetchMCPTools(state))
+	mux.HandleFunc("POST /api/config/mcp/oauth/start", handleStartMCPOAuth(state, mcpState))
+	mux.HandleFunc("POST /api/config/mcp/tools/fetch", handleFetchMCPTools(state, mcpState))
 	mux.HandleFunc("POST /api/config/mcp/tools/toggle", handleToggleMCPTool(state))
 	mux.HandleFunc("POST /api/model-prices", handleSaveModelPrice(state))
 	mux.HandleFunc("POST /api/model-prices/delete", handleDeleteModelPrice(state))
-}
-
-// ---------- 鉴权 ----------
-
-// adminAuthOK 判断当前请求是否通过管理端鉴权。
-//
-// 对应 Rust `proxy::server::check_admin_auth`（server.rs:120）：admin_token 为
-// None 或空字符串时免鉴权，否则要求 `Authorization: Bearer <token>` 完全相等。
-// 本包不能 import proxy（proxy 已经 import api，会成环），因此这里复刻同一份逻辑。
-func adminAuthOK(state *app.State, r *http.Request) bool {
-	expected := state.Config().Auth.AdminToken
-	if expected == nil || *expected == "" {
-		return true
-	}
-	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	return ok && token == *expected
-}
-
-// requireAdmin 在鉴权失败时写出 401 响应并返回 false。
-//
-// 响应体与 Rust `auth_error_response`（server.rs:132）逐字一致。
-func requireAdmin(w http.ResponseWriter, r *http.Request, state *app.State) bool {
-	if adminAuthOK(state, r) {
-		return true
-	}
-	writeJSON(w, http.StatusUnauthorized, struct {
-		Error struct {
-			Message string `json:"message"`
-			Type    string `json:"type"`
-		} `json:"error"`
-	}{Error: struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-	}{Message: "Invalid or missing admin token", Type: "auth_error"}})
-	return false
 }
 
 // ---------- 响应工具 ----------
@@ -215,35 +182,4 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
-}
-
-// ---------- MCP 运行期状态 ----------
-
-// 本包需要 mcp.State 来完成 OAuth 与工具拉取（tools/fetch、tools/toggle、oauth/*）。
-//
-// 已知偏差：proxy.NewServer 会另外构造一份 mcp.State（其 OAuth pending 表用于
-// `/oauth/callback`），而 api 拿不到那个指针（Register 的签名固定为 *app.State）。
-// 因此本包为自己的 handler 维护一份按 app.State 索引的 mcp.State：
-// token 的读写都走 config（`state.Update`），所以授权结果与状态查询完全一致；
-// 唯一差别是 StartOAuthFlow 写入的 pending state 落在本包这份 store 里，
-// 而 `/oauth/callback` 处理器读的是 proxy 那份 store —— 回调交换 token 因此无法命中，
-// 需要 proxy 侧复用同一份 State 才能打通（不改 mcp/proxy 包无法解决）。
-var (
-	mcpStateMu sync.Mutex
-	mcpStates  = map[*app.State]*mcp.State{}
-)
-
-// MCPSession 返回（惰性创建）与某个 app.State 绑定的唯一 mcp.State。
-//
-// 导出给 proxy 复用：/oauth/callback 与 oauth/start 必须读写同一份 pending 表，
-// 否则授权回调无法命中授权请求写入的 state。
-func MCPSession(state *app.State) *mcp.State {
-	mcpStateMu.Lock()
-	defer mcpStateMu.Unlock()
-	st, ok := mcpStates[state]
-	if !ok {
-		st = &mcp.State{Config: state, Client: state.HTTP, Audit: state.Audit, OAuth: mcp.NewOAuthStore()}
-		mcpStates[state] = st
-	}
-	return st
 }

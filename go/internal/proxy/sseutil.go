@@ -1,9 +1,10 @@
 package proxy
 
 import (
-	"bytes"
 	"encoding/json"
 	"strings"
+
+	"modelbridge/internal/sse"
 )
 
 // 流式错误检测：在把首个 chunk 转发给客户端之前，判断上游是否已经报错。
@@ -29,7 +30,7 @@ func DetectSSEErrorInPrefix(raw []byte) (string, bool) {
 			continue
 		}
 
-		data, ok := sseDataLine(trimmed)
+		data, ok := sse.Data(trimmed)
 		if !ok || data == "" || data == "[DONE]" {
 			continue
 		}
@@ -60,7 +61,7 @@ func DetectSSEErrorInPrefix(raw []byte) (string, bool) {
 	if hasEventError {
 		for _, line := range strings.Split(text, "\n") {
 			trimmed := strings.TrimSpace(line)
-			data, ok := sseDataLine(trimmed)
+			data, ok := sse.Data(trimmed)
 			if !ok || data == "" || data == "[DONE]" {
 				continue
 			}
@@ -76,7 +77,7 @@ func DetectSSEErrorInPrefix(raw []byte) (string, bool) {
 func SSEHasContentOutput(raw []byte) bool {
 	for _, line := range strings.Split(string(raw), "\n") {
 		trimmed := strings.TrimSpace(line)
-		data, ok := sseDataLine(trimmed)
+		data, ok := sse.Data(trimmed)
 		if !ok || data == "" || data == "[DONE]" {
 			continue
 		}
@@ -110,18 +111,4 @@ func SSEHasContentOutput(raw []byte) bool {
 	}
 
 	return false
-}
-
-// sseDataLine 从一行中取出 `data:` 之后并去除首尾空白的载荷。
-func sseDataLine(line string) (string, bool) {
-	rest, ok := strings.CutPrefix(line, "data:")
-	if !ok {
-		return "", false
-	}
-	return strings.TrimSpace(rest), true
-}
-
-// hasSSETerminator 判断缓冲区中是否已经出现流结束标志。
-func hasSSETerminator(raw []byte) bool {
-	return bytes.Contains(raw, []byte("data: [DONE]")) || bytes.Contains(raw, []byte("data:[DONE]"))
 }

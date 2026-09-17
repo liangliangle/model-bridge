@@ -63,6 +63,16 @@ type State struct {
 	oauthMu sync.Mutex
 }
 
+// NewState 构造中继运行期状态。
+//
+// 由装配点（cmd/model-bridge）构造一份，同时交给 mcp.Register（/mcp/* 与
+// /oauth/callback）和 api.Register（oauth/start、oauth/status、tools/fetch）：
+// OAuth 的 pending 表必须读写同一份，否则授权回调无法命中授权请求写入的 state。
+// OAuth store 由内部惰性创建（见 oauthStore）。
+func NewState(cfg ConfigStore, client *http.Client, sink AuditSink) *State {
+	return &State{Config: cfg, Client: client, Audit: sink}
+}
+
 // snapshot 返回配置快照；Config 未注入时返回 nil（调用方需判空）。
 func (s *State) snapshot() *config.AppConfig {
 	if s == nil || s.Config == nil {

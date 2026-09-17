@@ -1,15 +1,15 @@
 package converter
 
 import (
-	"bufio"
 	"bytes"
-	"io"
 	"strings"
+
+	"modelbridge/internal/sse"
 )
 
 // 本文件实现**流式方向**（对应 Rust converter/stream.rs）：
 //
-//   - scanSSE                              SSE 分帧（ocgo main.go::readSSE，line 2856）
+//   - SSE 分帧见 internal/sse（原 scanSSE，源自 ocgo main.go::readSSE，line 2856）
 //   - chatToAnthropicStream                Chat 上游流 → Anthropic 事件流
 //     （Rust stream.rs::ChatToAnthropicStream，line 1287）
 //   - responsesEmitter + chatToResponsesStream
@@ -24,88 +24,11 @@ import (
 
 // ==================== SSE 分帧 ====================
 
-// sseEvent 是一个已分帧的 SSE 事件：事件名（可能为空）与 data 载荷。
-// 对应 Rust stream.rs::SseEvent（line 51）。
-type sseEvent struct {
-	// Event 是 `event:` 行的值，未给出时为空串。
-	Event string
-	// Data 是全部 `data:` 行按 "\n" 拼接后的载荷（可能为 "[DONE]"）。
-	Data string
-}
-
-// scanSSE 按行扫描 SSE 并逐个交付完整事件。
-//
-// 移植自 ocgo main.go::readSSE（line 2856），保留其全部语义：
-//   - 空行结束一个事件；只有 `data:` 行的事件才交付（纯 event 行不成事件）；
-//   - `data:` 行按行拼接为载荷；
-//   - 载荷为 `[DONE]` 时结束扫描，且**不**交付给 handle（收尾由调用方的 finalize 负责）；
-//   - handle 返回错误时立即中止并原样返回该错误。
-//
-// 与 ocgo 的差异：ocgo 用 bufio.Scanner（单 token 上限 64KB，且按 chunk 读），
-// 这里用 bufio.Reader 按行缓冲，事件被任意 chunk 边界切开都能正确组帧
-// （对应 Rust stream.rs::SseBuffer（line 46）跨 chunk 的健壮性）。
-func scanSSE(r io.Reader, handle func(sseEvent) error) error {
-	br := bufio.NewReader(r)
-	event := ""
-	var data []string
-
-	// flush 交付一个完整事件；返回 (是否结束扫描, 错误)。
-	flush := func() (bool, error) {
-		if len(data) == 0 {
-			event = ""
-			return false, nil
-		}
-		payload := strings.Join(data, "\n")
-		data = nil
-		ev := sseEvent{Event: event, Data: payload}
-		event = ""
-		if payload == "[DONE]" {
-			return true, nil
-		}
-		if err := handle(ev); err != nil {
-			return true, err
-		}
-		return false, nil
-	}
-
-	for {
-		line, err := br.ReadString('\n')
-		if line != "" {
-			trimmed := strings.TrimRight(line, "\n")
-			trimmed = strings.TrimRight(trimmed, "\r")
-			switch {
-			case trimmed == "":
-				stop, herr := flush()
-				if herr != nil {
-					return herr
-				}
-				if stop {
-					return nil
-				}
-			case strings.HasPrefix(trimmed, "event:"):
-				event = strings.TrimSpace(trimmed[len("event:"):])
-			case strings.HasPrefix(trimmed, "data:"):
-				data = append(data, strings.TrimSpace(trimmed[len("data:"):]))
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-	}
-	if _, herr := flush(); herr != nil {
-		return herr
-	}
-	return nil
-}
-
 // streamConverter 是一条流式方向的状态机。
 // 对应 Rust stream.rs::StreamConverter（line 15，`process_chunk` 换成按事件驱动）。
 type streamConverter interface {
 	// processEvent 处理一个上游事件，返回若干条已编码的下游 SSE 字节块。
-	processEvent(ev sseEvent) [][]byte
+	processEvent(ev sse.Event) [][]byte
 	// finalize 是流结束时的收尾（补齐终局事件，并带上已累加的真实 usage）。
 	finalize() [][]byte
 	// usage 返回累计观察到的**上游** usage（Anthropic 口径，见 Usage）。
@@ -260,7 +183,7 @@ func (s *chatToAnthropicStream) ensureReasoningBlock(out *[][]byte) {
 
 // processEvent 处理一个上游 Chat 事件。对应 Rust
 // stream.rs::ChatToAnthropicStream::process_chunk（line 1420）。
-func (s *chatToAnthropicStream) processEvent(ev sseEvent) [][]byte {
+func (s *chatToAnthropicStream) processEvent(ev sse.Event) [][]byte {
 	var out [][]byte
 	if ev.Data == "[DONE]" {
 		s.finishInto(&out, s.stopReason())
@@ -832,7 +755,7 @@ type chatToResponsesStream struct {
 }
 
 // newChatToResponsesStream 创建 chat → responses 的流式转换器；
-// ns 是 Session.nsReverse（flat 工具名 → namespace/subtool）。
+// ns 是 session.nsReverse（flat 工具名 → namespace/subtool）。
 func newChatToResponsesStream(model string, ns map[string]nsEntry) streamConverter {
 	return &chatToResponsesStream{
 		emitter:           newResponsesEmitter(model, ns),
@@ -842,7 +765,7 @@ func newChatToResponsesStream(model string, ns map[string]nsEntry) streamConvert
 
 // processEvent 处理一个上游 Chat 事件。
 // 对应 Rust stream.rs::ChatCompletionsToResponsesStream::process_chunk（line 638）。
-func (s *chatToResponsesStream) processEvent(ev sseEvent) [][]byte {
+func (s *chatToResponsesStream) processEvent(ev sse.Event) [][]byte {
 	var out [][]byte
 	if ev.Data == "[DONE]" {
 		s.emitter.finish(&out)

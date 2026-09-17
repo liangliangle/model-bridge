@@ -7,9 +7,11 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"modelbridge/internal/sse"
 )
 
-// 本文件覆盖流式方向：scanSSE 分帧、chat → messages、chat → responses、
+// 本文件覆盖流式方向：SSE 分帧（internal/sse）、chat → messages、chat → responses、
 // 以及三个 replay*（完整响应对象重放为 SSE）。
 //
 // 断言方式与 Rust 的集成测试一致：喂原始 SSE 字节 → 收集下游字节 → 解析事件断言
@@ -18,7 +20,7 @@ import (
 // ==================== 测试辅助 ====================
 
 // chunkedReader 按 sizes 指定的分片大小依次返回 data（循环使用），
-// 用来把同一段上游字节流按任意 chunk 边界切开喂给 scanSSE / ConvertStreamResponse。
+// 用来把同一段上游字节流按任意 chunk 边界切开喂给 sse.Scan / ConvertStreamResponse。
 type chunkedReader struct {
 	data  []byte
 	sizes []int
@@ -46,8 +48,8 @@ func (r *chunkedReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// sseData 把一段 JSON 载荷包成一条 data 事件。
-func sseData(payload string) string {
+// dataEvent 把一段 JSON 载荷包成一条 data 事件。
+func dataEvent(payload string) string {
 	return "data: " + payload + "\n\n"
 }
 
@@ -63,11 +65,11 @@ type parsedEvent struct {
 	Raw   string
 }
 
-// parseSSE 用 scanSSE 解析下游字节流（同时验证输出确实是合法 SSE 帧）。
+// parseSSE 用 sse.Scan 解析下游字节流（同时验证输出确实是合法 SSE 帧）。
 func parseSSE(t *testing.T, raw []byte) []parsedEvent {
 	t.Helper()
 	var events []parsedEvent
-	err := scanSSE(bytes.NewReader(raw), func(ev sseEvent) error {
+	err := sse.Scan(bytes.NewReader(raw), func(ev sse.Event) error {
 		parsed := parsedEvent{Event: ev.Event, Raw: ev.Data}
 		if obj, err := decodeObject([]byte(ev.Data)); err == nil {
 			parsed.Data = obj
@@ -76,7 +78,7 @@ func parseSSE(t *testing.T, raw []byte) []parsedEvent {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("scanSSE(%s): %v", raw, err)
+		t.Fatalf("sse.Scan(%s): %v", raw, err)
 	}
 	return events
 }
@@ -139,18 +141,18 @@ func joinChunks(chunks [][]byte) []byte {
 }
 
 // runStream 通过门面跑一遍 chat 上游 → out 格式的流式转换。
-func runStream(t *testing.T, session *Session, out ApiFormat, model string, payload string, sizes []int) ([]byte, Usage) {
+func runStream(t *testing.T, session *convSession, out ApiFormat, model string, payload string, sizes []int) ([]byte, Usage) {
 	t.Helper()
 	var buf bytes.Buffer
 	reader := &chunkedReader{data: []byte(payload), sizes: sizes}
-	usage, err := session.ConvertStreamResponse(FormatOpenAIChat, out, reader, &buf, model, nil)
+	usage, err := session.convertStreamResponse(FormatOpenAIChat, out, reader, &buf, model, nil)
 	if err != nil {
 		t.Fatalf("ConvertStreamResponse: %v", err)
 	}
 	return buf.Bytes(), usage
 }
 
-// ==================== scanSSE ====================
+// ==================== SSE 分帧 ====================
 
 func TestScanSSEFraming(t *testing.T) {
 	payload := "event: response.created\ndata: {\"a\":1}\n\n" +
@@ -163,16 +165,16 @@ func TestScanSSEFraming(t *testing.T) {
 		"data: [DONE]\n\n" +
 		"data: {\"late\":true}\n\n" // [DONE] 之后不再交付
 
-	want := []sseEvent{
+	want := []sse.Event{
 		{Event: "response.created", Data: `{"a":1}`},
 		{Event: "", Data: "{\"b\":2}\n{\"c\":3}"},
 		{Event: "", Data: `{"d":4}`},
 		{Event: "", Data: `{"e":5}`},
 	}
 
-	collect := func(r io.Reader) ([]sseEvent, error) {
-		var got []sseEvent
-		err := scanSSE(r, func(ev sseEvent) error {
+	collect := func(r io.Reader) ([]sse.Event, error) {
+		var got []sse.Event
+		err := sse.Scan(r, func(ev sse.Event) error {
 			got = append(got, ev)
 			return nil
 		})
@@ -182,7 +184,7 @@ func TestScanSSEFraming(t *testing.T) {
 	// 基线：整段一次读完。
 	got, err := collect(strings.NewReader(payload))
 	if err != nil {
-		t.Fatalf("scanSSE: %v", err)
+		t.Fatalf("sse.Scan: %v", err)
 	}
 	if len(got) != len(want) {
 		t.Fatalf("事件数 = %d (%#v), want %d", len(got), got, len(want))
@@ -201,7 +203,7 @@ func TestScanSSEFraming(t *testing.T) {
 		}
 		split, err := collect(&chunkedReader{data: []byte(payload), sizes: sizes})
 		if err != nil {
-			t.Fatalf("offset %d: scanSSE: %v", offset, err)
+			t.Fatalf("offset %d: sse.Scan: %v", offset, err)
 		}
 		if len(split) != len(want) {
 			t.Fatalf("offset %d: 事件数 = %d (%#v), want %d", offset, len(split), split, len(want))
@@ -216,7 +218,7 @@ func TestScanSSEFraming(t *testing.T) {
 	// 逐字节喂入同样等价。
 	byteWise, err := collect(&chunkedReader{data: []byte(payload), sizes: []int{1}})
 	if err != nil {
-		t.Fatalf("逐字节: scanSSE: %v", err)
+		t.Fatalf("逐字节: sse.Scan: %v", err)
 	}
 	if len(byteWise) != len(want) {
 		t.Fatalf("逐字节: 事件数 = %d, want %d", len(byteWise), len(want))
@@ -230,7 +232,7 @@ func TestScanSSEFraming(t *testing.T) {
 	// 无分隔符结尾的残段也要在 EOF 时交付。
 	tail, err := collect(strings.NewReader("data: {\"f\":6}"))
 	if err != nil {
-		t.Fatalf("残段: scanSSE: %v", err)
+		t.Fatalf("残段: sse.Scan: %v", err)
 	}
 	if len(tail) != 1 || tail[0].Data != `{"f":6}` {
 		t.Fatalf("残段事件 = %#v", tail)
@@ -240,8 +242,8 @@ func TestScanSSEFraming(t *testing.T) {
 func TestScanSSEHandleErrorAborts(t *testing.T) {
 	wantErr := errors.New("boom")
 	calls := 0
-	payload := sseData(`{"n":1}`) + sseData(`{"n":2}`) + sseData(`{"n":3}`)
-	err := scanSSE(strings.NewReader(payload), func(ev sseEvent) error {
+	payload := dataEvent(`{"n":1}`) + dataEvent(`{"n":2}`) + dataEvent(`{"n":3}`)
+	err := sse.Scan(strings.NewReader(payload), func(ev sse.Event) error {
 		calls++
 		return wantErr
 	})
@@ -255,15 +257,15 @@ func TestScanSSEHandleErrorAborts(t *testing.T) {
 
 // ==================== chat → messages（流式）====================
 
-var chatTextStream = sseData(`{"id":"c1","model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`) +
-	sseData(`{"id":"c1","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"he"},"finish_reason":null}]}`) +
-	sseData(`{"id":"c1","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"llo"},"finish_reason":null}]}`) +
-	sseData(`{"id":"c1","model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`) +
-	sseData(`{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":123,"completion_tokens":45,"total_tokens":168}}`) +
-	sseData(`[DONE]`)
+var chatTextStream = dataEvent(`{"id":"c1","model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`) +
+	dataEvent(`{"id":"c1","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"he"},"finish_reason":null}]}`) +
+	dataEvent(`{"id":"c1","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"llo"},"finish_reason":null}]}`) +
+	dataEvent(`{"id":"c1","model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`) +
+	dataEvent(`{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":123,"completion_tokens":45,"total_tokens":168}}`) +
+	dataEvent(`[DONE]`)
 
 func TestChatToAnthropicStreamEventOrderAndUsage(t *testing.T) {
-	session := NewSession()
+	session := newConvSession()
 	raw, usage := runStream(t, session, FormatAnthropic, "claude-x", chatTextStream, []int{len(chatTextStream)})
 
 	events := parseSSE(t, raw)
@@ -288,7 +290,7 @@ func TestChatToAnthropicStreamEventOrderAndUsage(t *testing.T) {
 		t.Fatalf("message_start.model = %q, want claude-x", got)
 	}
 	fallback := newChatToAnthropicStream("")
-	fallbackOut := joinChunks(fallback.processEvent(sseEvent{Data: `{"id":"c1","model":"upstream-model","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}`}))
+	fallbackOut := joinChunks(fallback.processEvent(sse.Event{Data: `{"id":"c1","model":"upstream-model","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}`}))
 	fallbackMessage := mustMapField(t, eventsOfType(parseSSE(t, fallbackOut), "message_start")[0], "message")
 	if got, _ := asString(fallbackMessage["model"]); got != "upstream-model" {
 		t.Fatalf("回退模型名 = %q, want upstream-model", got)
@@ -352,11 +354,11 @@ func TestChatToAnthropicStreamEventOrderAndUsage(t *testing.T) {
 }
 
 func TestChatToAnthropicStreamCacheTokensUseAnthropicConvention(t *testing.T) {
-	payload := sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40}}}`) +
-		sseData(`[DONE]`)
+	payload := dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40}}}`) +
+		dataEvent(`[DONE]`)
 
-	session := NewSession()
+	session := newConvSession()
 	raw, usage := runStream(t, session, FormatAnthropic, "m", payload, []int{len(payload)})
 	delta := eventsOfType(parseSSE(t, raw), "message_delta")[0]
 	deltaUsage, _ := asMap(delta["usage"])
@@ -372,13 +374,13 @@ func TestChatToAnthropicStreamCacheTokensUseAnthropicConvention(t *testing.T) {
 }
 
 func TestChatToAnthropicStreamToolUse(t *testing.T) {
-	payload := sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"loc"}}]},"finish_reason":null}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ation\":\"SF\"}"}}]},"finish_reason":null}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3}}`) +
-		sseData(`[DONE]`)
+	payload := dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"loc"}}]},"finish_reason":null}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ation\":\"SF\"}"}}]},"finish_reason":null}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3}}`) +
+		dataEvent(`[DONE]`)
 
-	session := NewSession()
+	session := newConvSession()
 	raw, usage := runStream(t, session, FormatAnthropic, "m", payload, []int{len(payload)})
 	events := parseSSE(t, raw)
 
@@ -435,8 +437,8 @@ func TestChatToAnthropicStreamToolUse(t *testing.T) {
 
 func TestChatToAnthropicStreamFinalizeWithoutDone(t *testing.T) {
 	// 上游不发 [DONE] 直接断流：finalize 必须补齐 message_delta / message_stop。
-	payload := sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}`)
-	session := NewSession()
+	payload := dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}`)
+	session := newConvSession()
 	raw, _ := runStream(t, session, FormatAnthropic, "m", payload, []int{len(payload)})
 	names := eventNames(parseSSE(t, raw))
 	want := []string{"message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"}
@@ -446,9 +448,9 @@ func TestChatToAnthropicStreamFinalizeWithoutDone(t *testing.T) {
 
 	// 显式 [DONE] 事件同样触发收尾，且重复触发不会再发一次。
 	conv := newChatToAnthropicStream("m")
-	first := conv.processEvent(sseEvent{Data: `{"id":"c1","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"length"}],"usage":{"prompt_tokens":9,"completion_tokens":7}}`})
-	done := conv.processEvent(sseEvent{Data: "[DONE]"})
-	again := conv.processEvent(sseEvent{Data: "[DONE]"})
+	first := conv.processEvent(sse.Event{Data: `{"id":"c1","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"length"}],"usage":{"prompt_tokens":9,"completion_tokens":7}}`})
+	done := conv.processEvent(sse.Event{Data: "[DONE]"})
+	again := conv.processEvent(sse.Event{Data: "[DONE]"})
 	if len(again) != 0 {
 		t.Fatalf("重复 [DONE] 不应再生产事件: %v", again)
 	}
@@ -487,7 +489,7 @@ func mustMapField(t *testing.T, obj map[string]any, key string) map[string]any {
 // ==================== chat → responses（流式）====================
 
 func TestChatToResponsesStreamEventOrderAndUsage(t *testing.T) {
-	session := NewSession()
+	session := newConvSession()
 	raw, usage := runStream(t, session, FormatResponses, "gpt-4o", chatTextStream, []int{len(chatTextStream)})
 	events := parseSSE(t, raw)
 
@@ -599,11 +601,11 @@ func TestChatToResponsesStreamEventOrderAndUsage(t *testing.T) {
 
 func TestChatToResponsesStreamUsageAlwaysPresent(t *testing.T) {
 	// 上游完全不给 usage：response.completed 仍必须带零值 usage 对象。
-	payload := sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`) +
-		sseData(`[DONE]`)
+	payload := dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`) +
+		dataEvent(`[DONE]`)
 
-	session := NewSession()
+	session := newConvSession()
 	raw, _ := runStream(t, session, FormatResponses, "m", payload, []int{len(payload)})
 	completed := eventsOfType(parseSSE(t, raw), "response.completed")[0]
 	completedResp := mustMapField(t, completed, "response")
@@ -630,7 +632,7 @@ func TestChatToResponsesStreamUsageAlwaysPresent(t *testing.T) {
 }
 
 func TestChatToResponsesStreamNamespaceAndCustomTools(t *testing.T) {
-	session := NewSession()
+	session := newConvSession()
 	flat, ok := flattenNamespaceSubtool("mcp__tools", map[string]any{
 		"name":       "sub_a",
 		"parameters": map[string]any{"type": "object"},
@@ -642,13 +644,13 @@ func TestChatToResponsesStreamNamespaceAndCustomTools(t *testing.T) {
 	flatName, _ := asString(fn["name"])
 	registerCustomTool("exec", session.nsReverse)
 
-	payload := sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"`+flatName+`","arguments":"{\"a\":"}}]},"finish_reason":null}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"exec","arguments":"{\"content\":\"return"}}]},"finish_reason":null}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":" 1\"}"}}]},"finish_reason":null}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8}}`) +
-		sseData(`[DONE]`)
+	payload := dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"`+flatName+`","arguments":"{\"a\":"}}]},"finish_reason":null}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"exec","arguments":"{\"content\":\"return"}}]},"finish_reason":null}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":" 1\"}"}}]},"finish_reason":null}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8}}`) +
+		dataEvent(`[DONE]`)
 
 	raw, usage := runStream(t, session, FormatResponses, "m", payload, []int{len(payload)})
 	events := parseSSE(t, raw)
@@ -766,12 +768,12 @@ func TestChatToResponsesStreamNamespaceAndCustomTools(t *testing.T) {
 }
 
 func TestChatToResponsesStreamReasoningPart(t *testing.T) {
-	payload := sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"reasoning_content":"想"},"finish_reason":null}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"答"},"finish_reason":null}]}`) +
-		sseData(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`) +
-		sseData(`[DONE]`)
+	payload := dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"reasoning_content":"想"},"finish_reason":null}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"答"},"finish_reason":null}]}`) +
+		dataEvent(`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`) +
+		dataEvent(`[DONE]`)
 
-	session := NewSession()
+	session := newConvSession()
 	raw, _ := runStream(t, session, FormatResponses, "m", payload, []int{len(payload)})
 	events := parseSSE(t, raw)
 
@@ -1031,7 +1033,7 @@ func TestConvertStreamResponseChunkBoundaryInvariance(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			session := NewSession()
+			session := newConvSession()
 			baseline, baselineUsage := runStream(t, session, tc.out, "m", tc.payload, []int{len(tc.payload)})
 			for offset := 0; offset <= len(tc.payload); offset++ {
 				sizes := []int{offset, len(tc.payload) - offset}
@@ -1056,8 +1058,8 @@ func TestConvertStreamResponseChunkBoundaryInvariance(t *testing.T) {
 func TestFullResponseToSSEFacade(t *testing.T) {
 	// in == out：仅重放，不做转换。
 	chat := []byte(`{"id":"chatcmpl-1","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)
-	chatSession := NewSession()
-	raw, err := chatSession.FullResponseToSSE(FormatOpenAIChat, FormatOpenAIChat, chat, "m")
+	chatSession := newConvSession()
+	raw, err := chatSession.fullResponseToSSE(FormatOpenAIChat, FormatOpenAIChat, chat, "m")
 	if err != nil {
 		t.Fatalf("FullResponseToSSE(chat→chat): %v", err)
 	}
@@ -1066,8 +1068,8 @@ func TestFullResponseToSSEFacade(t *testing.T) {
 	}
 
 	// in != out：先转换再重放为入口格式的事件流。
-	responsesSession := NewSession()
-	raw, err = responsesSession.FullResponseToSSE(FormatOpenAIChat, FormatResponses, chat, "m")
+	responsesSession := newConvSession()
+	raw, err = responsesSession.fullResponseToSSE(FormatOpenAIChat, FormatResponses, chat, "m")
 	if err != nil {
 		t.Fatalf("FullResponseToSSE(chat→responses): %v", err)
 	}
@@ -1076,8 +1078,8 @@ func TestFullResponseToSSEFacade(t *testing.T) {
 		t.Fatalf("responses 重放事件 = %v", names)
 	}
 
-	messagesSession := NewSession()
-	raw, err = messagesSession.FullResponseToSSE(FormatOpenAIChat, FormatAnthropic, chat, "m")
+	messagesSession := newConvSession()
+	raw, err = messagesSession.fullResponseToSSE(FormatOpenAIChat, FormatAnthropic, chat, "m")
 	if err != nil {
 		t.Fatalf("FullResponseToSSE(chat→messages): %v", err)
 	}
@@ -1088,10 +1090,10 @@ func TestFullResponseToSSEFacade(t *testing.T) {
 	}
 
 	// 矩阵外的组合必须报错。
-	if _, err := chatSession.FullResponseToSSE(FormatOpenAIChat, FormatAnthropic, []byte(`{`), "m"); err == nil {
+	if _, err := chatSession.fullResponseToSSE(FormatOpenAIChat, FormatAnthropic, []byte(`{`), "m"); err == nil {
 		t.Fatalf("非法 JSON 必须报错")
 	}
-	if _, err := chatSession.ConvertStreamResponse(FormatAnthropic, FormatResponses, strings.NewReader(""), io.Discard, "m", nil); err == nil {
+	if _, err := chatSession.convertStreamResponse(FormatAnthropic, FormatResponses, strings.NewReader(""), io.Discard, "m", nil); err == nil {
 		t.Fatalf("messages → responses 必须返回 *UnsupportedConversion")
 	} else if _, ok := err.(*UnsupportedConversion); !ok {
 		t.Fatalf("错误类型 = %T, want *UnsupportedConversion", err)

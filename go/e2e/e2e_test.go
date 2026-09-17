@@ -12,10 +12,14 @@ import (
 	"strings"
 	"testing"
 
+	"modelbridge/internal/api"
 	"modelbridge/internal/app"
 	"modelbridge/internal/audit"
 	"modelbridge/internal/config"
+	"modelbridge/internal/mcp"
 	"modelbridge/internal/proxy"
+	"modelbridge/internal/sse"
+	"modelbridge/internal/web"
 )
 
 // 端到端验证：真实启动后端（proxy.NewServer），以 mock 上游为渠道端点，
@@ -93,11 +97,23 @@ func newHarness(t *testing.T, specs ...channelSpec) *harness {
 	t.Cleanup(func() { _ = db.Close() })
 
 	state := app.New(cfg, filepath.Join(dir, "config.yaml"), db)
-	handler, _ := proxy.NewServer(state)
+	handler, _ := newBackend(state)
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 
 	return &harness{t: t, mock: mock, state: state, server: srv, dir: dir}
+}
+
+// newBackend 按 cmd/model-bridge 的装配顺序组装完整 handler（代理入口 + 管理 API +
+// MCP 中继 + 静态兜底，最后套 CORS/panic 中间件），并返回 MCP 中继状态。
+func newBackend(state *app.State) (http.Handler, *mcp.State) {
+	mcpState := mcp.NewState(state, state.HTTP, state.Audit)
+	mux := http.NewServeMux()
+	proxy.Register(mux, state)
+	api.Register(mux, state, mcpState)
+	mcp.Register(mux, mcpState)
+	mux.HandleFunc("/", web.StaticHandler)
+	return proxy.Middleware(mux), mcpState
 }
 
 func (h *harness) post(path, body string) (*http.Response, string) {
@@ -159,39 +175,27 @@ func (h *harness) do(method, path, bodyJSON, token string) (*http.Response, stri
 	return resp, string(raw)
 }
 
-// sseEvent 是一个已解析的下游 SSE 事件。
-type sseEvent struct {
-	Event string
-	Data  string
-}
-
-// parseSSE 解析下游事件流；忽略注释与空行。
-func parseSSE(t *testing.T, raw string) []sseEvent {
+// parseSSE 解析下游事件流，复用后端的 internal/sse（分帧规则只有一处实现）。
+//
+// sse.Scan 把 `[DONE]` 视为流结束标志且不交付该事件，而这里的断言要看流尾标记，
+// 因此收到过 [DONE] 时补一个 data 为 "[DONE]" 的事件。
+func parseSSE(t *testing.T, raw string) []sse.Event {
 	t.Helper()
-	var out []sseEvent
-	for _, block := range strings.Split(raw, "\n\n") {
-		if strings.TrimSpace(block) == "" {
-			continue
-		}
-		var ev sseEvent
-		for _, line := range strings.Split(block, "\n") {
-			if v, ok := strings.CutPrefix(line, "event: "); ok {
-				ev.Event = strings.TrimSpace(v)
-			} else if v, ok := strings.CutPrefix(line, "data: "); ok {
-				ev.Data = strings.TrimSpace(v)
-			} else if v, ok := strings.CutPrefix(line, "data:"); ok {
-				ev.Data = strings.TrimSpace(v)
-			}
-		}
-		if ev.Data != "" {
-			out = append(out, ev)
-		}
+	var out []sse.Event
+	if err := sse.Scan(strings.NewReader(raw), func(ev sse.Event) error {
+		out = append(out, ev)
+		return nil
+	}); err != nil {
+		t.Fatalf("解析下游 SSE 失败: %v", err)
+	}
+	if strings.Contains(raw, sse.Done) {
+		out = append(out, sse.Event{Data: sse.Done})
 	}
 	return out
 }
 
 // sseTypes 返回 data 载荷里 type 字段（Anthropic/Responses 形态）或 "chat.chunk"。
-func sseTypes(t *testing.T, events []sseEvent) []string {
+func sseTypes(t *testing.T, events []sse.Event) []string {
 	t.Helper()
 	var out []string
 	for _, ev := range events {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"modelbridge/internal/app"
+	"modelbridge/internal/auth"
 	"modelbridge/internal/channel"
 	"modelbridge/internal/config"
 	"modelbridge/internal/converter"
@@ -28,7 +29,7 @@ func RouteRequest(state *app.State, ctx *RequestContext, w http.ResponseWriter) 
 			&ctx.HeadersJSON, ptrStr(string(ctx.RawBody)), ptrStrOrNil(ctx.UserAgent)); err == nil {
 			_ = state.Audit.UpdateError(id, http.StatusBadRequest, msSince(start), msg)
 		}
-		writeError(w, http.StatusBadRequest, "invalid_request_error", msg)
+		auth.WriteError(w, http.StatusBadRequest, "invalid_request_error", msg)
 		return
 	}
 
@@ -40,7 +41,7 @@ func RouteRequest(state *app.State, ctx *RequestContext, w http.ResponseWriter) 
 			&ctx.HeadersJSON, ptrStr(string(ctx.RawBody)), ptrStrOrNil(ctx.UserAgent)); err == nil {
 			_ = state.Audit.UpdateError(id, status, msSince(start), message)
 		}
-		writeError(w, status, errType, message)
+		auth.WriteError(w, status, errType, message)
 		return
 	}
 
@@ -93,7 +94,7 @@ func RouteRequest(state *app.State, ctx *RequestContext, w http.ResponseWriter) 
 
 			// 请求本身不合法时换渠道也没有意义，直接返回。
 			if errorStatus == http.StatusBadRequest {
-				writeError(w, http.StatusBadRequest, "invalid_request_error", msg)
+				auth.WriteError(w, http.StatusBadRequest, "invalid_request_error", msg)
 				return
 			}
 		}
@@ -103,7 +104,7 @@ func RouteRequest(state *app.State, ctx *RequestContext, w http.ResponseWriter) 
 	if strings.HasPrefix(lastError, "invalid_request:") {
 		status = http.StatusBadRequest
 	}
-	writeError(w, status, "server_error", "All channels failed: "+lastError)
+	auth.WriteError(w, status, "server_error", "All channels failed: "+lastError)
 }
 
 // routeErrorResponse 把选路错误映射为 HTTP 状态与文案。

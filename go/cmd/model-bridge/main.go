@@ -11,20 +11,25 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"modelbridge/internal/api"
 	"modelbridge/internal/app"
 	"modelbridge/internal/audit"
 	"modelbridge/internal/channel"
 	"modelbridge/internal/config"
+	"modelbridge/internal/mcp"
 	"modelbridge/internal/proxy"
+	"modelbridge/internal/web"
 )
 
 func main() {
@@ -41,6 +46,12 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 	applyCLIOverrides(cfg)
+
+	// 暴露面自检：绑定非回环地址却没有鉴权时告警（严格模式直接拒绝启动）。
+	// 放在建库之前，让告警在启动日志的最前面就出现。
+	if err := checkExposure(cfg); err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	db, err := audit.Open(config.AuditDBPath())
 	if err != nil {
@@ -80,12 +91,24 @@ func main() {
 	// 后台每日清理。
 	go dailyCleanup(ctx, state)
 
-	handler, mcpState := proxy.NewServer(state)
+	// 装配：代理入口、管理 API、MCP 中继、静态资源。
+	//
+	// 装配点在这里（而不是某个库包里），各包只导出自己的路由注册函数，
+	// proxy 不再 import api。mcpState 只构造一份：OAuth 的 pending 表必须由
+	// /api/config/mcp/oauth/start 写入、由 /oauth/callback 读回。
+	mcpState := mcp.NewState(state, state.HTTP, state.Audit)
+	mux := http.NewServeMux()
+	proxy.Register(mux, state)             // /v1/*
+	api.Register(mux, state, mcpState)     // /api/*
+	mcp.Register(mux, mcpState)            // /mcp/* 与 /oauth/callback
+	mux.HandleFunc("/", web.StaticHandler) // 内嵌前端 + SPA fallback
+	handler := proxy.Middleware(mux)       // CORS + panic 恢复
+
 	// 后台刷新即将过期的 MCP OAuth token（请求时的惰性刷新仍是兜底）。
 	stopTokenRefresher := mcpState.StartTokenRefresher(ctx)
 	defer stopTokenRefresher()
 
-	addr := cfg.ListenHost + ":" + strconv.Itoa(int(cfg.ListenPort))
+	addr := listenAddr(cfg)
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: handler,
@@ -152,6 +175,36 @@ func applyCLIOverrides(cfg *config.AppConfig) {
 			cfg.Debug = true
 		}
 	}
+}
+
+// listenAddr 拼出监听地址（与 http.Server 使用的形式一致）。
+func listenAddr(cfg *config.AppConfig) string {
+	return cfg.ListenHost + ":" + strconv.Itoa(int(cfg.ListenPort))
+}
+
+// checkExposure 检查监听地址的暴露面：对外可达却缺少鉴权时打印告警。
+//
+// 为什么需要它：默认配置监听 127.0.0.1，一旦改成 0.0.0.0（例如从 Docker 或别的机器访问），
+// 管理 API、代理入口就会对同网段完全开放；而这两种「未配置 token」的状态在运行期完全
+// 静默——请求全部成功，看不出任何异常。因此把风险提前说到启动日志里。
+//
+// 设置 MODEL_BRIDGE_REQUIRE_AUTH=1（任何非空、非 "0" 的值）可把告警升级为拒绝启动，
+// 用于公网部署时避免误开。
+func checkExposure(cfg *config.AppConfig) error {
+	warnings := config.ExposureWarnings(cfg)
+	if len(warnings) == 0 {
+		return nil
+	}
+	if v := strings.TrimSpace(os.Getenv("MODEL_BRIDGE_REQUIRE_AUTH")); v != "" && v != "0" {
+		return fmt.Errorf("refusing to start: %s is reachable from other hosts but has no auth (MODEL_BRIDGE_REQUIRE_AUTH=%s): %s",
+			listenAddr(cfg), v, strings.Join(warnings, "; "))
+	}
+	log.Printf("WARNING: listening on %s, which is reachable from other hosts:", listenAddr(cfg))
+	for _, w := range warnings {
+		log.Printf("WARNING:   - %s", w)
+	}
+	log.Printf("WARNING: 仅本机使用请把 listen_host 改回 127.0.0.1；对外提供服务请配置 auth.admin_token 与 auth.proxy_tokens")
+	return nil
 }
 
 // dailyCleanup 每天清理一次过期审计记录与详情大字段。

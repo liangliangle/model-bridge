@@ -43,7 +43,7 @@ func convertMessages(t *testing.T, body string, opts RequestOptions) map[string]
 }
 
 // convertResponses 是 Responses → Chat 的测试入口。
-func convertResponses(t *testing.T, s *Session, body string, opts RequestOptions) map[string]any {
+func convertResponses(t *testing.T, s *convSession, body string, opts RequestOptions) map[string]any {
 	t.Helper()
 	out, err := s.responsesToChat(mustDecode(t, body), opts)
 	if err != nil {
@@ -225,7 +225,7 @@ func TestConvertRequestReasoningCacheEcho(t *testing.T) {
 	}
 
 	// Responses 方向同样命中缓存。
-	cached := convertResponses(t, NewSession(), `{"input":[{"type":"function_call","call_id":"echo-1","name":"fn","arguments":"{}"}]}`, RequestOptions{})
+	cached := convertResponses(t, newConvSession(), `{"input":[{"type":"function_call","call_id":"echo-1","name":"fn","arguments":"{}"}]}`, RequestOptions{})
 	if got, _ := asString(at(t, messageList(t, cached), 0)["reasoning_content"]); got != "缓存里的推理" {
 		t.Fatalf("responses reasoning_content = %q", got)
 	}
@@ -342,7 +342,7 @@ func TestConvertRequestReasoningEffortFolding(t *testing.T) {
 	}
 
 	// Responses 方向的 reasoning.effort 同样折叠（Codex 夹具形态）。
-	out := convertResponses(t, NewSession(), `{"model":"gpt-5-codex","input":"hi","reasoning":{"effort":"medium","summary":"auto"}}`, RequestOptions{})
+	out := convertResponses(t, newConvSession(), `{"model":"gpt-5-codex","input":"hi","reasoning":{"effort":"medium","summary":"auto"}}`, RequestOptions{})
 	if got, _ := asString(out["reasoning_effort"]); got != "medium" {
 		t.Fatalf("reasoning_effort = %q, want medium", got)
 	}
@@ -361,10 +361,10 @@ func TestConvertRequestModelOverride(t *testing.T) {
 	}
 	// Responses 方向同理。
 	responses := `{"model":"gpt-4o","input":"hi"}`
-	if got, _ := asString(convertResponses(t, NewSession(), responses, RequestOptions{Model: "upstream-2"})["model"]); got != "upstream-2" {
+	if got, _ := asString(convertResponses(t, newConvSession(), responses, RequestOptions{Model: "upstream-2"})["model"]); got != "upstream-2" {
 		t.Fatalf("responses model = %q", got)
 	}
-	if got, _ := asString(convertResponses(t, NewSession(), responses, RequestOptions{})["model"]); got != "gpt-4o" {
+	if got, _ := asString(convertResponses(t, newConvSession(), responses, RequestOptions{})["model"]); got != "gpt-4o" {
 		t.Fatalf("responses model = %q", got)
 	}
 }
@@ -415,7 +415,7 @@ func TestResponsesNamespaceFlattening(t *testing.T) {
 			]}
 		]
 	}`
-	session := NewSession()
+	session := newConvSession()
 	out := convertResponses(t, session, req, RequestOptions{})
 
 	tools, ok := asArray(out["tools"])
@@ -445,8 +445,8 @@ func TestResponsesNamespaceFlattening(t *testing.T) {
 		t.Fatalf("nsReverse = %#v, want %#v", session.nsReverse, wantReverse)
 	}
 
-	t.Run("两个 Session 不共享状态", func(t *testing.T) {
-		s1, s2 := NewSession(), NewSession()
+	t.Run("两个 session 不共享状态", func(t *testing.T) {
+		s1, s2 := newConvSession(), newConvSession()
 		convertResponses(t, s1, `{"input":"a","tools":[{"type":"namespace","name":"ns_1","tools":[{"type":"function","name":"t1"}]}]}`, RequestOptions{})
 		convertResponses(t, s2, `{"input":"b","tools":[{"type":"namespace","name":"ns_2","tools":[{"type":"function","name":"t2"}]}]}`, RequestOptions{})
 		if _, ok := s1.nsReverse["ns_1__t1"]; !ok {
@@ -463,11 +463,11 @@ func TestResponsesNamespaceFlattening(t *testing.T) {
 		}
 	})
 
-	t.Run("零值 Session 也能用", func(t *testing.T) {
-		var zero Session
+	t.Run("零值 session 也能用", func(t *testing.T) {
+		var zero convSession
 		convertResponses(t, &zero, `{"input":"a","tools":[{"type":"namespace","name":"ns_z","tools":[{"type":"function","name":"tz"}]}]}`, RequestOptions{})
 		if _, ok := zero.nsReverse["ns_z__tz"]; !ok {
-			t.Fatalf("零值 Session 未写入 nsReverse")
+			t.Fatalf("零值 session 未写入 nsReverse")
 		}
 	})
 }
@@ -478,7 +478,7 @@ func TestResponsesNamespaceNameSanitization(t *testing.T) {
 		{"type":"namespace","name":"ns.with.dots","tools":[{"type":"function","name":"sub.tool","parameters":{"type":"object"}}]},
 		{"type":"namespace","name":"` + longName + `","tools":[{"type":"function","name":"tool","parameters":{"type":"object"}}]}
 	]}`
-	session := NewSession()
+	session := newConvSession()
 	out := convertResponses(t, session, req, RequestOptions{})
 	tools, _ := asArray(out["tools"])
 	if len(tools) != 2 {
@@ -511,7 +511,7 @@ func TestResponsesCustomToolRegistration(t *testing.T) {
 	req := `{"input":"t","tools":[
 		{"type":"custom","name":"exec","description":"Run code","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}
 	]}`
-	session := NewSession()
+	session := newConvSession()
 	out := convertResponses(t, session, req, RequestOptions{})
 	tools, _ := asArray(out["tools"])
 	if len(tools) != 1 {
@@ -550,7 +550,7 @@ func TestResponsesInputItems(t *testing.T) {
 		],
 		"text": {"format": {"type": "json_schema", "name": "answer", "schema": {"type": "object"}, "strict": true}}
 	}`
-	out := convertResponses(t, NewSession(), req, RequestOptions{})
+	out := convertResponses(t, newConvSession(), req, RequestOptions{})
 	if n, _ := asInt(out["max_tokens"]); n != 256 {
 		t.Fatalf("max_tokens = %v", out["max_tokens"])
 	}
@@ -591,7 +591,7 @@ func TestResponsesInputItems(t *testing.T) {
 }
 
 func TestResponsesInputStringAndToolChoice(t *testing.T) {
-	out := convertResponses(t, NewSession(), `{"model":"gpt-4o","input":"北京天气","tool_choice":{"type":"function","name":"f"}}`, RequestOptions{})
+	out := convertResponses(t, newConvSession(), `{"model":"gpt-4o","input":"北京天气","tool_choice":{"type":"function","name":"f"}}`, RequestOptions{})
 	messages := messageList(t, out)
 	if got := jsonText(t, at(t, messages, 0)); got != `{"content":"北京天气","role":"user"}` {
 		t.Fatalf("user = %s", got)
@@ -599,7 +599,7 @@ func TestResponsesInputStringAndToolChoice(t *testing.T) {
 	if got := jsonText(t, out["tool_choice"]); got != `{"function":{"name":"f"},"type":"function"}` {
 		t.Fatalf("tool_choice = %s", got)
 	}
-	if got := jsonText(t, convertResponses(t, NewSession(), `{"input":"x","tool_choice":"auto"}`, RequestOptions{})["tool_choice"]); got != `"auto"` {
+	if got := jsonText(t, convertResponses(t, newConvSession(), `{"input":"x","tool_choice":"auto"}`, RequestOptions{})["tool_choice"]); got != `"auto"` {
 		t.Fatalf("tool_choice = %s", got)
 	}
 }
@@ -614,7 +614,7 @@ func TestResponsesBuiltinTools(t *testing.T) {
 		{"type":"mcp","server_label":"srv"},
 		{"type":"totally_unknown","name":"nope"}
 	]}`
-	out := convertResponses(t, NewSession(), req, RequestOptions{})
+	out := convertResponses(t, newConvSession(), req, RequestOptions{})
 	tools, _ := asArray(out["tools"])
 	names := make([]string, 0, len(tools))
 	types := make([]string, 0, len(tools))
@@ -667,7 +667,7 @@ func TestCodexFixtureToolAccounting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode fixture: %v", err)
 	}
-	session := NewSession()
+	session := newConvSession()
 	out, err := session.responsesToChat(req, RequestOptions{Stream: true})
 	if err != nil {
 		t.Fatalf("responsesToChat: %v", err)
@@ -722,7 +722,7 @@ func TestCodexFixtureToolAccounting(t *testing.T) {
 
 func TestSanitizeToolMessages(t *testing.T) {
 	t.Run("缺失 tool_result 补占位", func(t *testing.T) {
-		out := convertResponses(t, NewSession(), `{"input":[{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]}`, RequestOptions{})
+		out := convertResponses(t, newConvSession(), `{"input":[{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]}`, RequestOptions{})
 		messages := messageList(t, out)
 		if len(messages) != 2 {
 			t.Fatalf("messages = %s", jsonText(t, messages))
@@ -733,14 +733,14 @@ func TestSanitizeToolMessages(t *testing.T) {
 	})
 
 	t.Run("孤儿 tool 消息被丢弃", func(t *testing.T) {
-		out := convertResponses(t, NewSession(), `{"input":[{"type":"function_call_output","call_id":"c9","output":"x"}]}`, RequestOptions{})
+		out := convertResponses(t, newConvSession(), `{"input":[{"type":"function_call_output","call_id":"c9","output":"x"}]}`, RequestOptions{})
 		if messages := messageList(t, out); len(messages) != 0 {
 			t.Fatalf("孤儿 tool 消息应被丢弃，got %s", jsonText(t, messages))
 		}
 	})
 
 	t.Run("重复结果只保留第一条", func(t *testing.T) {
-		out := convertResponses(t, NewSession(), `{"input":[
+		out := convertResponses(t, newConvSession(), `{"input":[
 			{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
 			{"type":"function_call_output","call_id":"c1","output":"first"},
 			{"type":"function_call_output","call_id":"c1","output":"second"}
@@ -809,7 +809,7 @@ func TestStreamingUsageAndStreamOptions(t *testing.T) {
 	})
 
 	t.Run("Responses 方向：opts.Stream 打开 include_usage", func(t *testing.T) {
-		out := convertResponses(t, NewSession(), `{"input":"hi"}`, RequestOptions{Stream: true})
+		out := convertResponses(t, newConvSession(), `{"input":"hi"}`, RequestOptions{Stream: true})
 		if streaming, _ := asBool(out["stream"]); !streaming {
 			t.Fatalf("stream 未打开：%s", jsonText(t, out))
 		}
@@ -924,11 +924,11 @@ func TestImageGate(t *testing.T) {
 	t.Run("端到端：带图片的 Messages 请求被拦下", func(t *testing.T) {
 		body := []byte(`{"model":"m","max_tokens":8,"messages":[{"role":"user","content":[
 			{"type":"image","source":{"type":"url","url":"http://img"}}]}]}`)
-		session := NewSession()
-		if _, err := session.BuildUpstreamRequest(FormatAnthropic, FormatOpenAIChat, body, RequestOptions{SupportsImages: false}); err == nil {
+		session := newConvSession()
+		if _, err := session.buildUpstreamRequest(FormatAnthropic, FormatOpenAIChat, body, RequestOptions{SupportsImages: false}); err == nil {
 			t.Fatalf("应返回不支持图片的错误")
 		}
-		if _, err := session.BuildUpstreamRequest(FormatAnthropic, FormatOpenAIChat, body, RequestOptions{SupportsImages: true}); err != nil {
+		if _, err := session.buildUpstreamRequest(FormatAnthropic, FormatOpenAIChat, body, RequestOptions{SupportsImages: true}); err != nil {
 			t.Fatalf("支持图片时不应报错：%v", err)
 		}
 	})

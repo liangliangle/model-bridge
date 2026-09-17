@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+
+	"modelbridge/internal/sse"
 )
 
 // ---------- serde_json::Value 兼容的小工具 ----------
@@ -66,19 +68,6 @@ func usageU64(usage map[string]any, keys ...string) (uint64, bool) {
 		}
 	}
 	return 0, false
-}
-
-// sseData 取出 SSE 行的 data 负载并去掉首尾空白，对应
-// `line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")).map(str::trim)`。
-func sseData(line string) (string, bool) {
-	d, ok := strings.CutPrefix(line, "data: ")
-	if !ok {
-		d, ok = strings.CutPrefix(line, "data:")
-		if !ok {
-			return "", false
-		}
-	}
-	return strings.TrimSpace(d), true
 }
 
 // prettyJSON 等价于 serde_json::to_string_pretty：2 空格缩进、不转义 HTML、无结尾换行。
@@ -191,7 +180,7 @@ func assembleStreamingResponse(raw string) string {
 
 	for _, line := range strings.Split(raw, "\n") {
 		// 解析 SSE data 行
-		data, ok := sseData(line)
+		data, ok := sse.Data(line)
 		if !ok {
 			continue
 		}
@@ -345,7 +334,7 @@ func assembleResponsesStream(raw string) (string, bool) {
 	var text strings.Builder
 
 	for _, line := range strings.Split(raw, "\n") {
-		data, ok := sseData(line)
+		data, ok := sse.Data(line)
 		if !ok {
 			continue
 		}

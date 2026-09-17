@@ -6,44 +6,35 @@ import (
 	"log"
 	"net/http"
 	"sort"
-	"strings"
 
-	"modelbridge/internal/api"
 	"modelbridge/internal/app"
+	"modelbridge/internal/auth"
 	"modelbridge/internal/converter"
-	"modelbridge/internal/mcp"
-	"modelbridge/internal/web"
 )
 
-// HTTP 服务：注册路由；入口 handler 只负责鉴权、读取请求体、创建 RequestContext。
+// HTTP 服务：注册代理入口路由；入口 handler 只负责鉴权、读取请求体、创建 RequestContext。
 // 对应 Rust `proxy/server.rs`。
+//
+// 管理 API、MCP 中继与静态资源的路由由装配点（cmd/model-bridge）分别调用
+// api.Register / mcp.Register / web.StaticHandler 注册：本包不 import 它们。
+// 此前 proxy → api 的反向依赖（由 api 复刻鉴权、并维护按 app.State 索引的全局
+// mcp.State 表来绕开）由此消失，鉴权统一走 internal/auth。
 
 // maxBodyBytes 与 Rust `DefaultBodyLimit::max(64MB)` 一致。
 const maxBodyBytes = 64 * 1024 * 1024
 
-// NewServer 组装完整的 HTTP 处理链，并返回 MCP 中继状态
-// （调用方用它启动后台 OAuth token 刷新）。
-func NewServer(state *app.State) (http.Handler, *mcp.State) {
-	mux := http.NewServeMux()
-
-	// 代理入口
+// Register 注册代理入口路由（/v1/*）。
+func Register(mux *http.ServeMux, state *app.State) {
 	mux.HandleFunc("/v1/chat/completions", proxyEntry(state, converter.FormatOpenAIChat, "/v1/chat/completions"))
 	mux.HandleFunc("/v1/completions", proxyEntry(state, converter.FormatOpenAIChat, "/v1/completions"))
 	mux.HandleFunc("/v1/responses", proxyEntry(state, converter.FormatResponses, "/v1/responses"))
 	mux.HandleFunc("/v1/messages", proxyEntry(state, converter.FormatAnthropic, "/v1/messages"))
 	mux.HandleFunc("/v1/models", handleListModels(state))
+}
 
-	// 管理 API 与 MCP 中继由各自包注册；OAuth 回调在 mcp 包内（不走 admin 鉴权）。
-	api.Register(mux, state)
-	// 与 api 包共用同一份 mcp.State：/oauth/callback 必须能读到 oauth/start 写入的
-	// pending state，两份 store 会让授权回调永远无法命中。
-	mcpState := api.MCPSession(state)
-	mcp.Register(mux, mcpState)
-
-	// 静态资源兜底（内嵌前端 + SPA fallback）
-	mux.HandleFunc("/", web.StaticHandler)
-
-	return withRecovery(withCORS(mux)), mcpState
+// Middleware 是整棵路由的最外层包装：CORS + panic 恢复。
+func Middleware(next http.Handler) http.Handler {
+	return withRecovery(withCORS(next))
 }
 
 // withCORS 等价于 Rust 的 `CorsLayer::permissive()`。
@@ -67,7 +58,7 @@ func withRecovery(next http.Handler) http.Handler {
 		defer func() {
 			if rec := recover(); rec != nil {
 				log.Printf("panic while handling %s %s: %v", r.Method, r.URL.Path, rec)
-				writeError(w, http.StatusInternalServerError, "server_error", "Internal server error (panic)")
+				auth.WriteError(w, http.StatusInternalServerError, "server_error", "Internal server error (panic)")
 			}
 		}()
 		next.ServeHTTP(w, r)
@@ -77,8 +68,7 @@ func withRecovery(next http.Handler) http.Handler {
 // proxyEntry 构造一个代理入口 handler。
 func proxyEntry(state *app.State, format converter.ApiFormat, path string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if reject := checkProxyAuth(state, r); reject != nil {
-			reject(w)
+		if !auth.RequireProxy(w, r, state) {
 			return
 		}
 		body, ok := readBody(w, r)
@@ -94,8 +84,7 @@ func proxyEntry(state *app.State, format converter.ApiFormat, path string) http.
 // handleListModels 返回模型列表；配置为空时从启用渠道的 model_mapping 收集。
 func handleListModels(state *app.State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if reject := checkProxyAuth(state, r); reject != nil {
-			reject(w)
+		if !auth.RequireProxy(w, r, state) {
 			return
 		}
 		cfg := state.Config()
@@ -135,70 +124,7 @@ func handleListModels(state *app.State) http.HandlerFunc {
 	}
 }
 
-// ---------- 鉴权 ----------
-
-// extractBearerToken 从 Authorization 头提取 Bearer token。
-func extractBearerToken(r *http.Request) (string, bool) {
-	v := r.Header.Get("Authorization")
-	token, ok := strings.CutPrefix(v, "Bearer ")
-	return token, ok
-}
-
-// checkProxyAuth 返回 nil 表示通过；否则返回一个写出 401 的闭包。
-// 未配置 proxy_tokens 时免鉴权。
-func checkProxyAuth(state *app.State, r *http.Request) func(http.ResponseWriter) {
-	tokens := state.Config().Auth.ProxyTokens
-	if len(tokens) == 0 {
-		return nil
-	}
-	if token, ok := extractBearerToken(r); ok {
-		for _, t := range tokens {
-			if t == token {
-				return nil
-			}
-		}
-	}
-	return func(w http.ResponseWriter) {
-		writeError(w, http.StatusUnauthorized, "auth_error", "Invalid or missing API key")
-	}
-}
-
-// CheckAdminAuth 供管理 API 使用：返回 nil 表示通过，否则返回带 401 写出的闭包。
-// 未配置 admin_token 或为空字符串时免鉴权（与 Rust 一致）。
-func CheckAdminAuth(state *app.State, r *http.Request) func(http.ResponseWriter) {
-	adminToken := state.Config().Auth.AdminToken
-	if adminToken == nil || *adminToken == "" {
-		return nil
-	}
-	if token, ok := extractBearerToken(r); ok && token == *adminToken {
-		return nil
-	}
-	return func(w http.ResponseWriter) {
-		writeError(w, http.StatusUnauthorized, "auth_error", "Invalid or missing admin token")
-	}
-}
-
 // ---------- 通用响应工具 ----------
-
-// errorBody 是错误响应体的形状，与 Rust 侧逐字一致。
-type errorBody struct {
-	Error struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-	} `json:"error"`
-}
-
-// WriteError 写出标准错误响应，供 api / mcp 包复用。
-func WriteError(w http.ResponseWriter, status int, errType, message string) {
-	writeError(w, status, errType, message)
-}
-
-func writeError(w http.ResponseWriter, status int, errType, message string) {
-	var body errorBody
-	body.Error.Message = message
-	body.Error.Type = errType
-	writeJSON(w, status, body)
-}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -217,10 +143,10 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 		if ok := asMaxBytesError(err, &maxErr); ok {
 			log.Printf("Request rejected (413 Payload Too Large): path=%s content-length=%d limit=%d bytes",
 				r.URL.Path, r.ContentLength, maxBodyBytes)
-			writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "Request body too large")
+			auth.WriteError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "Request body too large")
 			return nil, false
 		}
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body: "+err.Error())
+		auth.WriteError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body: "+err.Error())
 		return nil, false
 	}
 	return body, true
