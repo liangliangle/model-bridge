@@ -85,7 +85,14 @@ func Open(path string) (*DB, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("failed to create tables: %w", err)
 	}
-	return &DB{conn: conn, path: path}, nil
+	db := &DB{conn: conn, path: path}
+	// 老版本的库列更少：CREATE TABLE IF NOT EXISTS 是空操作，必须显式补列，
+	// 否则查询会报 no such column（见 migrate.go 顶部说明）。
+	if err := db.migrateSchema(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 // Close 关闭数据库。

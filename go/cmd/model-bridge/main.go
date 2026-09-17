@@ -48,6 +48,14 @@ func main() {
 	}
 	defer func() { _ = db.Close() }()
 
+	// 大字段拆分迁移（幂等：已迁移则跳过）。老库在迁移前大字段还在主表里，
+	// 不迁移则详情/列表查询拿不到内容。
+	if migrated, err := db.MigrateSplitBodies(); err != nil {
+		log.Printf("audit_db migration failed (old schema preserved): %v", err)
+	} else if migrated {
+		log.Printf("audit_db migration: body-split completed, DB compacted")
+	}
+
 	state := app.New(cfg, configPath, db)
 
 	// 启动清理：过期审计记录 + 只保留最近 N 条详情大字段。
