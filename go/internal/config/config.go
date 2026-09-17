@@ -5,10 +5,13 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -434,16 +437,389 @@ func setIfMissing[T any](present map[string]yaml.Node, key string, dst *T, def T
 	}
 }
 
-// SaveToFile 将配置写回磁盘（YAML），并同步更新内存中的旧字段别名。
+// SaveToFile 将配置写回磁盘（YAML）。
+//
+// 文件已存在时按「文档合并」写回：原有注释、键顺序与手写的未知字段都会保留，
+// 只有真正变化的取值被就地替换（新键追加在该映射末尾）。文件不存在、为空或
+// 无法解析时整体序列化一份新文档（无法解析时会打日志告警，绝不把用户的文件
+// 截断成读不回来的形态）。
+//
+// 落盘始终是 0600（配置里含 API key 与管理令牌），并通过「同目录临时文件 +
+// rename」原子替换——rename 顺带避免了覆盖正在运行的二进制时的 ETXTBSY。
 func (c *AppConfig) SaveToFile(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("failed to create config dir: %w", err)
 	}
+	out, err := c.encodeForSave(path)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(path, out, 0o600); err != nil {
+		return fmt.Errorf("failed to write config %s: %w", path, err)
+	}
+	return nil
+}
+
+// encodeForSave 生成落盘内容：优先在既有文档上做合并写回。
+func (c *AppConfig) encodeForSave(path string) ([]byte, error) {
+	existing, err := os.ReadFile(path)
+	switch {
+	case os.IsNotExist(err):
+		return marshalFresh(c)
+	case err != nil:
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+	if len(bytes.TrimSpace(existing)) == 0 {
+		// 空文件没有任何注释/顺序可保留，直接写一份新文档。
+		return marshalFresh(c)
+	}
+	out, mergeErr := mergeIntoDocument(existing, c, detectIndent(existing))
+	if mergeErr != nil {
+		// 不能让解析失败演变成「把用户文件截断」：整体重写一份能读回来的新文档。
+		log.Printf("config: 无法合并 %s（%v），改为整体重写配置文件", path, mergeErr)
+		return marshalFresh(c)
+	}
+	return out, nil
+}
+
+// detectIndent 推断既有文档的缩进宽度，让合并写回不会顺手把整篇重排。
+//
+// yaml.v3 的编码器只接受一个缩进宽度（默认 4），因此这里取「第一条有前导空格的
+// 行」的空格数：文件是 2 空格就一直 2 空格，是 4 空格就一直 4 空格。取值超过 9 或
+// 不是空格（制表符缩进在 YAML 里非法）时退回默认的 2——本仓库模板与手写配置都是 2。
+func detectIndent(content []byte) int {
+	for _, line := range strings.Split(string(content), "\n") {
+		spaces := len(line) - len(strings.TrimLeft(line, " "))
+		if spaces == 0 {
+			continue
+		}
+		if spaces <= 9 {
+			return spaces
+		}
+		break
+	}
+	return 2
+}
+
+// marshalFresh 整体序列化一份新文档（文件不存在或旧文件不可解析时的退路）。
+func marshalFresh(c *AppConfig) ([]byte, error) {
 	out, err := yaml.Marshal(c)
 	if err != nil {
-		return fmt.Errorf("failed to serialize config: %w", err)
+		return nil, fmt.Errorf("failed to serialize config: %w", err)
 	}
-	return os.WriteFile(path, out, 0o644)
+	return out, nil
+}
+
+// writeFileAtomic 在目标目录写临时文件（0600）后 rename 覆盖目标，保证读者要么看到
+// 旧文件要么看到新文件，不会读到写了一半的内容；权限由临时文件决定，因此即便原文件
+// 是 0644，覆盖后也是 mode。
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir, base := filepath.Dir(path), filepath.Base(path)
+	tmp, err := os.CreateTemp(dir, "."+base+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if tmpName != "" {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	tmpName = "" // rename 成功后临时文件已不存在，不需要再清理
+	return nil
+}
+
+// ---------- 合并写回：保留注释、键顺序与未知字段 ----------
+
+// yamlStrTag 是 yaml.v3 里字符串标量的标签（沿用文件里的引号风格时用它判断类型）。
+const yamlStrTag = "!!str"
+
+// legacyAliasKeys 是需要从文件里清除的旧字段名：映射路径 → {别名: 规范字段名}。
+// 只有当同一映射里已经写入了规范字段时别名才会被删除，避免出现新旧两份取值。
+var legacyAliasKeys = map[string]map[string]string{
+	"failover": {"max_retries": "max_failover_channels"},
+}
+
+// sequenceIdentityKeys 是需要按身份键逐元素合并的序列：映射路径 → 身份键。
+// 按身份合并才能保住每个元素上的注释；未列出的序列（models、proxy_tokens、
+// blocked_tools 等）整体替换元素，但保留序列自身的注释。
+var sequenceIdentityKeys = map[string]string{
+	"channels":     "id",
+	"mcp_servers":  "id",
+	"model_prices": "model",
+}
+
+// configSchema 描述配置结构在某一层允许出现的键。
+//
+// 由 AppConfig 的 yaml tag 反射生成（新增字段无需同步维护），用途只有一个：
+// 判断「文件里有、但本次配置没写出」的键该不该删除。属于 schema 的键说明配置侧
+// 已经把它清空（例如 omitempty 的 auth_token 被清掉），必须删除，否则下一次加载
+// 会把旧值复活；不属于 schema 的键是用户手写或更新版本添加的字段，必须原样保留。
+type configSchema struct {
+	keys    map[string]*configSchema // 映射键 → 子结构
+	element *configSchema            // 序列元素的结构
+	isMap   bool                     // map 类型：键由用户定义，内容完全以配置为准
+}
+
+// appConfigSchema 是 AppConfig 的 YAML 结构描述（进程内只构建一次）。
+var appConfigSchema = buildSchema(reflect.TypeOf(AppConfig{}), map[reflect.Type]*configSchema{})
+
+func buildSchema(t reflect.Type, seen map[reflect.Type]*configSchema) *configSchema {
+	if s, ok := seen[t]; ok {
+		return s
+	}
+	switch t.Kind() {
+	case reflect.Ptr:
+		s := buildSchema(t.Elem(), seen)
+		seen[t] = s
+		return s
+	case reflect.Map:
+		s := &configSchema{isMap: true}
+		seen[t] = s
+		return s
+	case reflect.Slice, reflect.Array:
+		s := &configSchema{element: buildSchema(t.Elem(), seen)}
+		seen[t] = s
+		return s
+	case reflect.Struct:
+		s := &configSchema{keys: make(map[string]*configSchema, t.NumField())}
+		seen[t] = s // 先登记，避免自引用类型无限递归
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.PkgPath != "" {
+				continue // 未导出字段（如 maxRetriesAlias）不参与 YAML 序列化
+			}
+			name, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+			if name == "" || name == "-" {
+				continue
+			}
+			s.keys[name] = buildSchema(f.Type, seen)
+		}
+		return s
+	default:
+		// 标量：没有子键。
+		s := &configSchema{}
+		seen[t] = s
+		return s
+	}
+}
+
+func (s *configSchema) child(key string) *configSchema {
+	if s == nil || s.keys == nil {
+		return nil
+	}
+	return s.keys[key]
+}
+
+// mergeIntoDocument 把配置合并进既有文档，返回合并后的 YAML 字节。
+// indent 是既有文档的缩进宽度（见 detectIndent），用于保持排版不变。
+func mergeIntoDocument(existing []byte, c *AppConfig, indent int) ([]byte, error) {
+	dst, dstRoot, err := parseDocument(existing)
+	if err != nil {
+		return nil, err
+	}
+	_, srcRoot, err := documentOf(c)
+	if err != nil {
+		return nil, err
+	}
+	mergeMapping(dstRoot, srcRoot, appConfigSchema, "")
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(indent)
+	if err := enc.Encode(dst); err != nil {
+		return nil, fmt.Errorf("failed to serialize config: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return nil, fmt.Errorf("failed to serialize config: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// parseDocument 把既有文件解析成 YAML 节点树，返回「待编码的节点」与「根映射节点」。
+func parseDocument(content []byte) (doc, root *yaml.Node, err error) {
+	var node yaml.Node
+	if uerr := yaml.Unmarshal(content, &node); uerr != nil {
+		return nil, nil, fmt.Errorf("failed to parse existing config: %w", uerr)
+	}
+	doc = &node
+	root = &node
+	if node.Kind == yaml.DocumentNode {
+		if len(node.Content) == 0 {
+			return nil, nil, fmt.Errorf("failed to parse existing config: empty document")
+		}
+		root = node.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return nil, nil, fmt.Errorf("failed to parse existing config: root is not a mapping")
+	}
+	return doc, root, nil
+}
+
+// documentOf 把配置序列化成节点树（同样返回待编码节点与根映射节点）。
+func documentOf(c *AppConfig) (doc, root *yaml.Node, err error) {
+	raw, err := marshalFresh(c)
+	if err != nil {
+		return nil, nil, err
+	}
+	return parseDocument(raw)
+}
+
+// mergeMapping 就地把 src 映射的取值合并进 dst 映射：同名键递归合并（保留 dst 的键
+// 节点、注释与样式），配置里新增的键追加到映射末尾，其余键的原有顺序不变。
+func mergeMapping(dst, src *yaml.Node, schema *configSchema, path string) {
+	if schema == nil || schema.isMap {
+		// 键完全由配置决定的映射（model_mapping、custom_headers 等）：内容以配置为准，
+		// 但保留映射节点自身的注释与样式。
+		dst.Content = src.Content
+		return
+	}
+	index := make(map[string]int, len(dst.Content)/2)
+	for i := 0; i+1 < len(dst.Content); i += 2 {
+		index[dst.Content[i].Value] = i
+	}
+	written := make(map[string]bool, len(src.Content)/2)
+	for i := 0; i+1 < len(src.Content); i += 2 {
+		key, value := src.Content[i], src.Content[i+1]
+		written[key.Value] = true
+		if at, ok := index[key.Value]; ok {
+			mergeNode(dst.Content[at+1], value, schema.child(key.Value), joinPath(path, key.Value))
+			continue
+		}
+		dst.Content = append(dst.Content, key, value)
+	}
+	kept := make([]*yaml.Node, 0, len(dst.Content))
+	for i := 0; i+1 < len(dst.Content); i += 2 {
+		if shouldDropKey(schema, path, dst.Content[i].Value, written) {
+			continue
+		}
+		kept = append(kept, dst.Content[i], dst.Content[i+1])
+	}
+	dst.Content = kept
+}
+
+// shouldDropKey 判断「文件里有、但配置没有写出」的键是否应从文件中删除。
+func shouldDropKey(schema *configSchema, path, key string, written map[string]bool) bool {
+	if written[key] {
+		return false
+	}
+	if canonical, ok := legacyAliasKeys[path][key]; ok {
+		// 旧字段别名（max_retries）：规范字段已写出时删除，否则保留，不丢用户数据。
+		return written[canonical]
+	}
+	if schema == nil || schema.keys == nil {
+		return false
+	}
+	_, known := schema.keys[key]
+	return known
+}
+
+// mergeNode 就地把 src 的取值合并进 dst，保留 dst 的注释、锚点与（可继续沿用的）样式。
+func mergeNode(dst, src *yaml.Node, schema *configSchema, path string) {
+	switch {
+	case dst.Kind == yaml.MappingNode && src.Kind == yaml.MappingNode:
+		mergeMapping(dst, src, schema, path)
+	case dst.Kind == yaml.SequenceNode && src.Kind == yaml.SequenceNode:
+		mergeSequence(dst, src, schema, path)
+	case dst.Kind == yaml.ScalarNode && src.Kind == yaml.ScalarNode:
+		mergeScalar(dst, src)
+	default:
+		// 形状变了（标量 ↔ 映射/序列、null ↔ 映射……）：整体采用新形状，保留注释。
+		adoptNode(dst, src)
+	}
+}
+
+// mergeScalar 用 src 的取值替换 dst 的取值，保留 dst 的注释；文件里原本用引号写的
+// 字符串，在新值同样是字符串时沿用引号风格（例如 listen_host: "0.0.0.0"）。
+func mergeScalar(dst, src *yaml.Node) {
+	style := src.Style
+	if src.Tag == yamlStrTag && dst.Style&(yaml.SingleQuotedStyle|yaml.DoubleQuotedStyle) != 0 {
+		style = dst.Style & (yaml.SingleQuotedStyle | yaml.DoubleQuotedStyle)
+	}
+	dst.Tag = src.Tag
+	dst.Value = src.Value
+	dst.Style = style
+}
+
+// adoptNode 让 dst 采用 src 的形状（类型发生变化时使用），保留 dst 上的注释与锚点。
+func adoptNode(dst, src *yaml.Node) {
+	head, line, foot, anchor := dst.HeadComment, dst.LineComment, dst.FootComment, dst.Anchor
+	*dst = *src
+	dst.HeadComment, dst.LineComment, dst.FootComment, dst.Anchor = head, line, foot, anchor
+}
+
+// mergeSequence 合并序列。有身份键的序列（channels/mcp_servers/model_prices）按身份
+// 就地合并，配置里新增的元素追加到末尾，配置里删掉的元素从文件中移除（元素自身的
+// 注释跟着元素走）；其余序列整体替换元素，只保留序列自身的注释。
+func mergeSequence(dst, src *yaml.Node, schema *configSchema, path string) {
+	if schema == nil {
+		schema = &configSchema{}
+	}
+	identity := sequenceIdentityKeys[path]
+	if identity == "" {
+		dst.Content = src.Content
+		dst.Style = src.Style // 空序列保持 `[]` 这种 flow 写法
+		return
+	}
+	index := make(map[string]int, len(dst.Content))
+	for i, item := range dst.Content {
+		index[identityValue(item, identity)] = i
+	}
+	merged := make([]bool, len(dst.Content))
+	for _, item := range src.Content {
+		if at, ok := index[identityValue(item, identity)]; ok {
+			mergeNode(dst.Content[at], item, schema.element, joinPath(path, "[]"))
+			merged[at] = true
+			continue
+		}
+		dst.Content = append(dst.Content, item)
+	}
+	kept := make([]*yaml.Node, 0, len(dst.Content))
+	for i, item := range dst.Content {
+		if i < len(merged) && !merged[i] {
+			continue // 配置里已删除的元素
+		}
+		kept = append(kept, item)
+	}
+	dst.Content = kept
+}
+
+// identityValue 取序列元素身份键的取值；元素不是映射或缺少身份键时返回空串
+// （与 Parse 后该字段为零值的行为一致，保证两侧仍然能配对）。
+func identityValue(item *yaml.Node, key string) string {
+	if item == nil || item.Kind != yaml.MappingNode {
+		return ""
+	}
+	for i := 0; i+1 < len(item.Content); i += 2 {
+		if item.Content[i].Value == key {
+			return item.Content[i+1].Value
+		}
+	}
+	return ""
+}
+
+func joinPath(parent, key string) string {
+	if parent == "" {
+		return key
+	}
+	return parent + "." + key
 }
 
 // SortedChannels 返回按优先级升序排列的已启用渠道（稳定排序，相同优先级保持配置顺序）。
