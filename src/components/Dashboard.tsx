@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "../lib/tauri";
-import { formatLatency, formatTokens } from "../lib/format";
+import { formatLatency, formatTokens, formatCost } from "../lib/format";
 
 interface Stats {
   total_requests: number;
@@ -11,6 +11,7 @@ interface Stats {
   cache_creation_tokens: number;
   error_count: number;
   success_count: number;
+  cost_usd: number;
 }
 
 interface ChannelHealthInfo {
@@ -26,6 +27,7 @@ interface ChannelHealthInfo {
   output_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
+  cost_usd: number;
 }
 
 interface AuditPreview {
@@ -87,6 +89,7 @@ export default function Dashboard() {
   const cacheRate = stats && (stats.input_tokens + stats.cache_read_tokens) > 0
     ? (stats.cache_read_tokens / (stats.input_tokens + stats.cache_read_tokens)) * 100
     : 0;
+  const costColor = (stats?.cost_usd ?? 0) > 0 ? "amber" : "slate";
   const periodLabels: Record<Period, string> = { today: "今天", "7d": "7 天", "30d": "30 天" };
 
   return (
@@ -109,10 +112,11 @@ export default function Dashboard() {
       </div>
 
       {loading && !stats ? <LoadingState /> : <>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
           <MetricCard label="总请求" value={(stats?.total_requests ?? 0).toLocaleString()} tone="slate" />
           <MetricCard label="成功" value={(stats?.success_count ?? 0).toLocaleString()} tone="green" />
           <MetricCard label="失败" value={(stats?.error_count ?? 0).toLocaleString()} tone="red" />
+          <MetricCard label="成本" value={formatCost(stats?.cost_usd)} tone={costColor} />
         </div>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
           <MetricCard compact label="总 Token" value={formatTokens(totalTokens)} tone="cyan" />
@@ -141,7 +145,7 @@ export default function Dashboard() {
           </PreviewCard>
         </div>
 
-        <section><h2 className="mb-3 font-display text-lg font-semibold text-th-text">快捷入口</h2><div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5"><QuickLink icon="▱" title="MCP 中继" detail="管理 MCP 服务" href="/mcp" /><QuickLink icon="▣" title="Skill 管理" detail="管理技能目录" href="/skills/list" /><QuickLink icon="♙" title="Agent 管理" detail="管理 Agent 配置" href="/skills/agents" /><QuickLink icon="≡" title="审计日志" detail="查看访问日志" href="/audit" /><QuickLink icon="⚙" title="系统设置" detail="系统参数配置" href="/settings" /></div></section>
+        <section><h2 className="mb-3 font-display text-lg font-semibold text-th-text">快捷入口</h2><div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3"><QuickLink icon="▱" title="MCP 中继" detail="管理 MCP 服务" href="/mcp" /><QuickLink icon="≡" title="审计日志" detail="查看访问日志" href="/audit" /><QuickLink icon="⚙" title="系统设置" detail="系统参数配置" href="/settings" /></div></section>
       </>}
     </div>
   );
@@ -156,7 +160,7 @@ function ChannelCard({ channel }: { channel: ChannelHealthInfo }) {
   const healthy = channel.state === "healthy";
   const status = channel.state === "degraded" ? "降级" : channel.state === "unhealthy" ? "不可用" : channel.state === "recovering" ? "恢复中" : "健康";
   const total = channel.input_tokens + channel.output_tokens + channel.cache_read_tokens;
-  return <div className="page-surface p-5"><div className="flex items-center justify-between border-b border-th-border pb-4"><div className="flex min-w-0 items-center gap-2.5"><span className={`h-2.5 w-2.5 shrink-0 rounded-full ${healthy ? "bg-emerald-500" : channel.state === "unhealthy" ? "bg-red-400" : "bg-amber-400"}`} /><span className="truncate font-display text-sm font-semibold text-th-text">{channel.name}</span></div><span className={`rounded-full px-2.5 py-1 text-[11px] ${healthy ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600"}`}>{status}</span></div><div className="space-y-3 pt-4"><InfoRow label="首 Token" value={channel.avg_first_byte_ms === null ? "—" : formatLatency(channel.avg_first_byte_ms)} /><InfoRow label="平均延迟" value={channel.avg_latency_ms === null ? "—" : formatLatency(channel.avg_latency_ms)} /><InfoRow label="成功率" value={channel.success_rate === null ? "—" : `${channel.success_rate}%`} /><InfoRow label="请求数" value={String(channel.total_requests)} /><InfoRow label="总 Token" value={formatTokens(total)} /><InfoRow label="缓存命中率" value={total ? `${((channel.cache_read_tokens / total) * 100).toFixed(1)}%` : "0%"} /></div></div>;
+  return <div className="page-surface p-5"><div className="flex items-center justify-between border-b border-th-border pb-4"><div className="flex min-w-0 items-center gap-2.5"><span className={`h-2.5 w-2.5 shrink-0 rounded-full ${healthy ? "bg-emerald-500" : channel.state === "unhealthy" ? "bg-red-400" : "bg-amber-400"}`} /><span className="truncate font-display text-sm font-semibold text-th-text">{channel.name}</span></div><span className={`rounded-full px-2.5 py-1 text-[11px] ${healthy ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600"}`}>{status}</span></div><div className="space-y-3 pt-4"><InfoRow label="首 Token" value={channel.avg_first_byte_ms === null ? "—" : formatLatency(channel.avg_first_byte_ms)} /><InfoRow label="平均延迟" value={channel.avg_latency_ms === null ? "—" : formatLatency(channel.avg_latency_ms)} /><InfoRow label="成功率" value={channel.success_rate === null ? "—" : `${channel.success_rate}%`} /><InfoRow label="请求数" value={String(channel.total_requests)} /><InfoRow label="总 Token" value={formatTokens(total)} /><InfoRow label="缓存命中率" value={total ? `${((channel.cache_read_tokens / total) * 100).toFixed(1)}%` : "0%"} /><InfoRow label="成本" value={formatCost(channel.cost_usd)} /></div></div>;
 }
 
 function InfoRow({ label, value }: { label: string; value: string }) { return <div className="flex items-center justify-between text-xs"><span className="text-th-text-s">{label}</span><span className="font-mono text-th-text">{value}</span></div>; }

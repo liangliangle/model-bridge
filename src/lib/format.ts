@@ -21,3 +21,15 @@ export function formatTokens(n: number | null | undefined): string {
   if (n < 10_000_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   return `${(n / 1_000_000_000).toFixed(2)}B`;
 }
+
+/**
+ * 格式化成本（美元）。
+ * - null/undefined → "—"
+ * - >= 1 → $X.XX
+ * - < 1 → $X.XXXX（保留 4 位小数，便于观察小额度）
+ */
+export function formatCost(n: number | null | undefined): string {
+  if (n === null || n === undefined) return "—";
+  if (n >= 1) return `$${n.toFixed(2)}`;
+  return `$${n.toFixed(4)}`;
+}

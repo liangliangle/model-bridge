@@ -2,13 +2,12 @@
  * App 根组件 — 顶部导航 + 主内容区 + 主题切换
  */
 import { useEffect, useState } from "react";
-import { BrowserRouter, Routes, Route, NavLink, Navigate, useLocation } from "react-router-dom";
+import { BrowserRouter, Routes, Route, NavLink, useLocation } from "react-router-dom";
 import Dashboard from "./components/Dashboard";
 import AuditPanel from "./components/AuditPanel";
 import ChannelConfig from "./components/ChannelConfig";
 import McpConfig from "./components/McpConfig";
-import SkillConfig from "./components/SkillConfig";
-import AgentConfig from "./components/AgentConfig";
+import ModelPriceConfig from "./components/ModelPriceConfig";
 import Settings from "./components/Settings";
 import AuthPage from "./components/AuthPage";
 import { clearAdminToken, getAdminToken, invoke, setAdminToken, type AuthStatus } from "./lib/tauri";
@@ -25,13 +24,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: "/audit", icon: "◉", label: "审计日志" },
   { to: "/channels", icon: "⬡", label: "渠道配置" },
   { to: "/mcp", icon: "⇄", label: "MCP 中继" },
-  {
-    to: "/skills", icon: "✦", label: "Skill 管理",
-    children: [
-      { to: "/skills/agents", label: "Agent 管理" },
-      { to: "/skills/list", label: "Skill 管理" },
-    ],
-  },
+  { to: "/prices", icon: "$", label: "模型价格" },
   { to: "/settings", icon: "⚙", label: "系统设置" },
 ];
 
@@ -97,9 +90,7 @@ function NavContent() {
             <Route path="/audit" element={<AuditPanel />} />
             <Route path="/channels" element={<ChannelConfig />} />
             <Route path="/mcp" element={<McpConfig />} />
-            <Route path="/skills" element={<Navigate to="/skills/list" replace />} />
-            <Route path="/skills/agents" element={<AgentConfig />} />
-            <Route path="/skills/list" element={<SkillConfig />} />
+            <Route path="/prices" element={<ModelPriceConfig />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
         </div>

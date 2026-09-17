@@ -3,7 +3,7 @@
  */
 import { useEffect, useState } from "react";
 import { invoke } from "../lib/tauri";
-import { formatLatency, formatTokens } from "../lib/format";
+import { formatLatency, formatTokens, formatCost } from "../lib/format";
 import AuditDetail from "./AuditDetail";
 
 export interface AuditListItem {
@@ -22,6 +22,7 @@ export interface AuditListItem {
   output_tokens: number | null;
   cache_read_tokens: number | null;
   cache_creation_tokens: number | null;
+  cost_usd: number | null;
   retry_count: number;
   error_message: string | null;
 }
@@ -50,6 +51,7 @@ export interface AuditEntry {
   output_tokens: number | null;
   cache_read_tokens: number | null;
   cache_creation_tokens: number | null;
+  cost_usd: number | null;
   retry_count: number;
   error_message: string | null;
   failover_chain: string | null;
@@ -82,6 +84,7 @@ const COLUMNS = [
   { id: "output", label: "输出 Token" },
   { id: "cache_read", label: "缓存读" },
   { id: "cache_write", label: "缓存写" },
+  { id: "cost", label: "成本" },
 ];
 
 const DEFAULT_COLS = COLUMNS.map(c => c.id);
@@ -249,6 +252,7 @@ export default function AuditPanel() {
               {visibleCols.includes("output") && <th className="px-4 py-3 text-right">输出</th>}
               {visibleCols.includes("cache_read") && <th className="px-4 py-3 text-right">缓存读</th>}
               {visibleCols.includes("cache_write") && <th className="px-4 py-3 text-right">缓存写</th>}
+              {visibleCols.includes("cost") && <th className="px-4 py-3 text-right">成本</th>}
             </tr>
           </thead>
           <tbody>
@@ -284,6 +288,7 @@ export default function AuditPanel() {
               {visibleCols.includes("output") && <td className="px-4 py-3 text-right text-xs text-th-text-m font-mono">{formatTokens(e.output_tokens)}</td>}
               {visibleCols.includes("cache_read") && <td className="px-4 py-3 text-right text-xs text-emerald-500 font-mono">{(e.cache_read_tokens ?? 0) > 0 ? formatTokens(e.cache_read_tokens) : "—"}</td>}
               {visibleCols.includes("cache_write") && <td className="px-4 py-3 text-right text-xs text-amber-500 font-mono">{(e.cache_creation_tokens ?? 0) > 0 ? formatTokens(e.cache_creation_tokens) : "—"}</td>}
+              {visibleCols.includes("cost") && <td className="px-4 py-3 text-right text-xs text-amber-500 font-mono">{formatCost(e.cost_usd)}</td>}
               </tr>
             ))}
             {entries.length === 0 && (

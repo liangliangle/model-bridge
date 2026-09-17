@@ -1,0 +1,130 @@
+{
+  "model": "gpt-5-codex",
+  "instructions": "You are Codex, a coding agent. Follow the user's instructions and use the provided tools.",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Refactor the failover module so priority wins over protocol, then run the tests."
+        }
+      ]
+    },
+    {
+      "type": "additional_tools",
+      "tools": [
+        {
+          "type": "namespace",
+          "name": "mcp__repo",
+          "description": "Repository inspection tools exposed over MCP.",
+          "tools": [
+            {
+              "type": "function",
+              "name": "search_files",
+              "description": "Search tracked files by regular expression.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pattern": { "type": "string" },
+                  "path": { "type": "string" }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+              },
+              "strict": false
+            },
+            {
+              "type": "function",
+              "name": "read_file",
+              "description": "Read a file from the workspace.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "path": { "type": "string" },
+                  "offset": { "type": "integer" },
+                  "limit": { "type": "integer" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+              },
+              "strict": false
+            }
+          ]
+        },
+        {
+          "type": "function",
+          "name": "shell",
+          "description": "Run a shell command in the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "array", "items": { "type": "string" } },
+              "workdir": { "type": "string" },
+              "timeout_ms": { "type": "number" }
+            },
+            "required": ["command"],
+            "additionalProperties": false
+          },
+          "strict": false
+        }
+      ]
+    },
+    {
+      "type": "additional_tools",
+      "tools": [
+        {
+          "type": "custom",
+          "name": "apply_patch",
+          "description": "Apply a patch to files in the workspace.",
+          "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": "start: patch"
+          }
+        },
+        {
+          "type": "function",
+          "name": "update_plan",
+          "description": "Record the current multi-step plan.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "explanation": { "type": "string" },
+              "plan": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "step": { "type": "string" },
+                    "status": {
+                      "type": "string",
+                      "enum": ["pending", "in_progress", "completed"]
+                    }
+                  },
+                  "required": ["step", "status"],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": ["plan"],
+            "additionalProperties": false
+          },
+          "strict": false
+        },
+        {
+          "type": "web_search"
+        }
+      ]
+    }
+  ],
+  "tools": [],
+  "tool_choice": "auto",
+  "parallel_tool_calls": false,
+  "reasoning": { "effort": "medium", "summary": "auto" },
+  "store": false,
+  "stream": true,
+  "include": ["reasoning.encrypted_content"],
+  "prompt_cache_key": "codex-fixture-0001"
+}

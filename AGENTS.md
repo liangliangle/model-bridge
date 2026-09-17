@@ -2,21 +2,70 @@
 
 ## Project Overview
 
-Model Bridge is a large model API proxy gateway with channel failover, MCP relay, and skill management. It ships as a single binary with an embedded web UI.
+Model Bridge is a large-model API proxy gateway: a single binary with an embedded web UI,
+providing protocol conversion, channel failover, MCP relay, and cost tracking.
+
+It accepts three client protocols — OpenAI Chat Completions, OpenAI Responses, and Anthropic
+Messages — and routes to channels that speak any of those three.
+
+The backend lives in `go/`. It serves `~/.model-bridge/config.yaml`, the admin API, and the proxy
+endpoints; the frontend in `src/` and the macOS client talk to it over the same HTTP contract.
+
+History worth knowing: the backend was originally written in Rust under `src-tauri/` and was
+rewritten in Go, after which the Rust tree was deleted. Source comments still cite the Rust files
+that a given behavior was ported from (e.g. "对应 Rust `src-tauri/src/audit/db.rs`") — those paths
+no longer exist in the working tree, but the commit history and the `main` branch still have them,
+so `git show <old-commit>:src-tauri/src/...` is how you consult the reference implementation.
+
+## Protocol Conversion Matrix
+
+**Read this before touching routing or the converter.** Conversion is deliberately limited to a
+single hop, with Chat Completions as the only hub:
+
+| Client (inbound) | Chat channel | Messages channel | Responses channel |
+|---|---|---|---|
+| Chat (`/v1/chat/completions`) | passthrough | no | no |
+| Messages (`/v1/messages`) | convert | passthrough | no |
+| Responses (`/v1/responses`) | convert | no | passthrough |
+
+Rule: the channel side must either match the client protocol (byte passthrough) or be a Chat
+channel (converted). Flattening Messages/Responses *into* Chat is mechanical; inventing
+Messages/Responses semantics *out of* Chat (thinking, cache_control, the Responses item
+lifecycle) is where the bugs live, and Messages ↔ Responses would need two chained hops.
+
+Invariants:
+
+- `ApiFormat.CanRouteTo` (`internal/converter/converter.go`) is the **single source of truth** for
+  this matrix. Both routing and the converter consult it — never restate the rule elsewhere.
+- `SelectRoutes` (`internal/channel/failover.go`) hard-filters channels that cannot serve the
+  client protocol, **then** orders the survivors purely by `priority`. Filtering outranks priority:
+  a Chat client never uses a Messages channel, even at priority 1.
+- When no channel can serve the client protocol, the router returns `400` **before dispatch** with
+  an explanatory message. Never degrade silently, and never send a request upstream in the wrong
+  protocol.
+- `buildUpstreamBody` (`internal/proxy/executor.go`) re-checks the matrix before dispatch and
+  fails with `invalid_request:` if it is violated. Routing already filtered, so this is the
+  backstop that keeps a wrong-protocol request from ever reaching an upstream.
 
 ## Project Structure
 
 - `src/` — React 18 frontend (TypeScript, Tailwind CSS, Vite)
-- `src-tauri/` — Rust backend (axum, tokio, rusqlite)
-  - `proxy/` — API request proxy (routing, execution, streaming)
-  - `converter/` — Request/response format conversion (OpenAI ↔ Anthropic)
-  - `channel/` — Channel config, health checks, failover
-  - `mcp/` — MCP relay (OAuth, tool filtering, header injection)
-  - `skill/` — Skill scanning and linking
-  - `provider/` — Provider adapters (OpenAI, Anthropic)
-  - `audit/` — Audit logging models
-- `public/` — Static assets
-- `config.example.yaml` — Reference configuration file
+- `go/` — Go backend (module `modelbridge`)
+  - `cmd/model-bridge/` — entry point: config load, audit DB, health checker, HTTP listen
+  - `internal/converter/` — protocol conversion (largest module; see the matrix above)
+  - `internal/proxy/` — `server.go` (routes), `router.go` (selection, audit, failover loop),
+    `executor.go` (per-channel execution, streaming error detection), `context.go`
+  - `internal/channel/` — health tracking / circuit breaker, `failover.go` routing
+  - `internal/audit/` — SQLite audit log; `assemble.go` rebuilds a readable response object
+    from a raw SSE stream for the detail view
+  - `internal/api/` — the `/api/*` admin handlers
+  - `internal/mcp/` — MCP relay (OAuth 2.1, tool filtering, header injection)
+  - `internal/cost/`, `internal/config/`, `internal/web/` — pricing, config, embedded frontend
+  - `e2e/` — end-to-end tests driving the real HTTP server against a mock upstream
+  - `docs/go-rewrite/feature-inventory.md` — the frozen contract inventory the rewrite was built to
+- `macos-client/` — SwiftUI menu bar client; talks to the admin HTTP API (independent build)
+- `public/` — static assets
+- `config.example.yaml` — reference configuration file
 
 ## Build & Development Commands
 
@@ -24,22 +73,54 @@ Model Bridge is a large model API proxy gateway with channel failover, MCP relay
 |---|---|
 | `pnpm dev` | Start Vite dev server on port 3000 (proxies `/api` → `:8080`) |
 | `pnpm build` | Build frontend to `dist/` |
-| `cd src-tauri && cargo build` | Build Rust backend (debug) |
-| `cd src-tauri && cargo build --release` | Build Rust backend (release) |
-| `cd src-tauri && cargo run` | Run backend locally |
-| `./build.sh` | Full release build: frontend + backend → single binary in `release/` |
+| `./build.sh` | Full build: frontend + Go backend → single binary in `release/` (`SKIP_FRONTEND=1` skips the frontend) |
+| `./restart.sh` | Stop the running server, rebuild the Go backend, start it in the background (PID in `.model-bridge.pid`, log in `model-bridge.log`) |
+| `cd go && ./build.sh` | Sync `dist/` into the Go module and build `go/bin/model-bridge` |
+| `cd go && go build -p 1 ./...` | Build the Go backend (serial: this machine has little RAM) |
+| `cd go && go test -p 1 ./...` | Run Go unit + end-to-end tests |
+| `cd go && ./scripts/verify-startup.sh` | Start the real binary twice and diff its responses |
+| `cd go && ./bin/model-bridge` | Run the Go backend locally |
 
-The running app serves the UI at `http://localhost:8080` and proxies API requests at `http://localhost:8080/v1/chat/completions`.
+**Build order matters.** `//go:embed` cannot reference files outside the module directory, so
+`go/build.sh` copies the repo's `dist/` into `go/internal/web/dist/` before compiling. Run
+`pnpm build` first (or let `./build.sh` do it). That copy is committed so a fresh clone can build
+without running the frontend build first.
+
+The listen address comes from `listen_host` / `listen_port` in `~/.model-bridge/config.yaml`
+(defaults `127.0.0.1:8080`). `./restart.sh` reads the port back out of that file, so it probes the
+same address the server actually binds.
+
+The running app serves the UI at `http://localhost:8080` and proxies all three protocol
+endpoints: `/v1/chat/completions`, `/v1/messages`, `/v1/responses`.
 
 ## Coding Style & Naming
 
 - **TypeScript/React**: 2-space indentation, strict mode enabled (`noUnusedLocals`, `noUnusedParameters`, `noFallthroughCasesInSwitch`). Components use PascalCase (`ChannelConfig.tsx`), utilities use camelCase (`format.ts`).
-- **Rust**: Follow standard `rustfmt` conventions. Modules use `snake_case`, types use `PascalCase`. Each domain lives in its own module with a `mod.rs`.
+- **Go**: standard `gofmt` formatting; packages are lowercase single words, exported identifiers PascalCase. Keep the Chinese doc comments that cite the behavior each function was ported from.
 - **Tailwind**: Use utility classes directly in JSX; avoid custom CSS unless unavoidable.
 
 ## Testing
 
-No test framework is currently configured. When adding tests, use `cargo test` for Rust and consider `vitest` for the frontend.
+Run with `cd go && go test -p 1 ./...`. Always pass `-p 1` — this environment has ~570 MiB of free
+RAM and parallel compilation gets OOM-killed.
+
+| Package | Covers |
+|---|---|
+| `internal/converter` | request/response/stream mapping for both directions, namespace round-trip, SSE framing at every byte offset |
+| `internal/channel` | protocol-matrix filtering, priority ordering, candidate cap, circuit breaker |
+| `internal/audit` | rebuilding a readable response object from raw SSE (Anthropic / Chat / Responses) |
+| `internal/api` | every admin endpoint against a real config file and a real SQLite DB |
+| `e2e` | the real HTTP server driven by a mock upstream: non-stream and stream for all three entries, failover ordering, MCP tool filtering, audit/cost persistence |
+
+Guidelines:
+
+- `e2e` tests must exercise the real path — build the app with `proxy.NewServer`, point channels at
+  the mock upstream, and assert on the bytes that reach the upstream and the bytes sent downstream.
+  Do not assert on internals or hardcode expected values that restate the implementation.
+- Evidence goes to the directory named by `$SCRATCH`; tests skip evidence writes when it is unset
+  but still run every assertion.
+- `mock_upstream.go` answers in all three protocols and records every request, so a test can prove
+  what was actually forwarded (e.g. `stream_options.include_usage`, `model` rewriting).
 
 ## Commit & PR Guidelines
 
@@ -49,4 +130,9 @@ No test framework is currently configured. When adding tests, use `cargo test` f
 
 ## Configuration
 
-User config lives at `~/.model-bridge/config.yaml`. Refer to `config.example.yaml` for all available options. Never commit real API keys or secrets.
+User config lives at `~/.model-bridge/config.yaml`. Refer to `config.example.yaml` for all
+available options. Never commit real API keys or secrets.
+
+- `failover.max_failover_channels` caps how many channels any single request may try; `0` means
+  unlimited. It is **not** a retry count — per-channel retries are `channels[].retry_count`.
+  The legacy key `max_retries` still loads as a serde alias; serialization writes the new name.
