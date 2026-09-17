@@ -10,3 +10,11 @@ src-tauri/target/
 .build/
 macos-client/.build/
 macos-client/dist/
+
+# Go 模块通过 //go:embed 内嵌前端产物；缺少该目录会导致编译失败，
+# 因此单独保留这一份（仓库根目录的 dist/ 仍作为构建产物忽略）。
+!go/internal/web/dist/
+!go/internal/web/dist/**
+
+# Go 构建产物
+go/bin/

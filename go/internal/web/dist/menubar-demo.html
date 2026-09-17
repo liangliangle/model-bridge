@@ -1,0 +1,1574 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Model Bridge - 独立 macOS 菜单栏客户端 (远程网关版)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=SF+Pro+Display:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Plus Jakarta Sans", "PingFang SC", "Helvetica Neue", sans-serif;
+      --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Plus Jakarta Sans", "PingFang SC", sans-serif;
+      --font-mono: "SF Mono", "JetBrains Mono", Menlo, Monaco, Consolas, monospace;
+
+      /* Dark mode (macOS native menu bar popover) */
+      --bg-desktop: radial-gradient(circle at 50% 0%, #1e293b 0%, #0f172a 50%, #020617 100%);
+      --menubar-bg: rgba(22, 27, 34, 0.72);
+      --menubar-border: rgba(255, 255, 255, 0.08);
+      --popover-bg: rgba(28, 33, 40, 0.92);
+      --popover-border: rgba(255, 255, 255, 0.12);
+      --card-bg: rgba(255, 255, 255, 0.04);
+      --card-hover: rgba(255, 255, 255, 0.07);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --text-main: #f3f4f6;
+      --text-sec: #9ca3af;
+      --text-muted: #6b7280;
+      --accent-blue: #38bdf8;
+      --accent-blue-glow: rgba(56, 189, 248, 0.25);
+      --accent-cyan: #22d3ee;
+      --accent-purple: #c084fc;
+      --accent-emerald: #34d399;
+      --accent-amber: #fbbf24;
+      --accent-rose: #f43f5e;
+      --shadow-popover: 0 24px 60px -12px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.12), 0 8px 24px -4px rgba(0, 0, 0, 0.4);
+    }
+
+    [data-theme="light"] {
+      --bg-desktop: radial-gradient(circle at 50% 0%, #e2e8f0 0%, #cbd5e1 50%, #94a3b8 100%);
+      --menubar-bg: rgba(255, 255, 255, 0.8);
+      --menubar-border: rgba(0, 0, 0, 0.08);
+      --popover-bg: rgba(255, 255, 255, 0.96);
+      --popover-border: rgba(0, 0, 0, 0.1);
+      --card-bg: rgba(0, 0, 0, 0.03);
+      --card-hover: rgba(0, 0, 0, 0.05);
+      --card-border: rgba(0, 0, 0, 0.06);
+      --text-main: #111827;
+      --text-sec: #4b5563;
+      --text-muted: #9ca3af;
+      --accent-blue: #0284c7;
+      --accent-blue-glow: rgba(2, 132, 199, 0.2);
+      --accent-cyan: #0891b2;
+      --accent-purple: #9333ea;
+      --accent-emerald: #059669;
+      --accent-amber: #d97706;
+      --accent-rose: #e11d48;
+      --shadow-popover: 0 24px 60px -12px rgba(0, 0, 0, 0.25), 0 0 0 1px rgba(0, 0, 0, 0.08), 0 8px 20px -4px rgba(0, 0, 0, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-desktop);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+      transition: background 0.3s ease;
+    }
+
+    /* ===== macOS Top Menu Bar ===== */
+    .macos-menubar {
+      height: 32px;
+      background: var(--menubar-bg);
+      backdrop-filter: blur(28px) saturate(180%);
+      -webkit-backdrop-filter: blur(28px) saturate(180%);
+      border-bottom: 1px solid var(--menubar-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+      font-size: 13px;
+      font-weight: 500;
+      z-index: 100;
+      position: sticky;
+      top: 0;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+    }
+
+    .menubar-left {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .apple-icon {
+      font-size: 15px;
+      line-height: 1;
+      opacity: 0.9;
+    }
+
+    .menubar-item {
+      color: var(--text-main);
+      opacity: 0.85;
+      cursor: default;
+      transition: opacity 0.15s;
+    }
+
+    .menubar-item.active {
+      font-weight: 600;
+      opacity: 1;
+    }
+
+    .menubar-right {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    /* Menu bar tray widget button */
+    .tray-button {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 8px;
+      height: 24px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      transition: all 0.15s ease;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--text-main);
+      position: relative;
+    }
+
+    .tray-button:hover {
+      background: rgba(255, 255, 255, 0.12);
+    }
+
+    .tray-button.active {
+      background: #007aff;
+      color: #ffffff;
+      box-shadow: 0 0 12px rgba(0, 122, 255, 0.4);
+    }
+
+    .tray-icon-badge {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+      border-radius: 3px;
+      background: linear-gradient(135deg, #0ea5e9, #6366f1);
+      color: white;
+      font-size: 9px;
+      font-weight: 800;
+      line-height: 1;
+    }
+
+    .tray-button.active .tray-icon-badge {
+      background: #ffffff;
+      color: #007aff;
+    }
+
+    .tray-pulse {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 6px #10b981;
+      animation: pulse-dot 2s infinite ease-in-out;
+    }
+
+    .tray-pulse.offline {
+      background: #ef4444;
+      box-shadow: 0 0 6px #ef4444;
+      animation: none;
+    }
+
+    .tray-pulse.connecting {
+      background: #f59e0b;
+      box-shadow: 0 0 6px #f59e0b;
+    }
+
+    @keyframes pulse-dot {
+      0%, 100% { transform: scale(1); opacity: 0.9; }
+      50% { transform: scale(1.3); opacity: 0.5; }
+    }
+
+    .system-tray-icons {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--text-sec);
+      font-size: 12px;
+    }
+
+    /* ===== Stage / Desktop Area ===== */
+    .desktop-stage {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      padding: 24px 20px 60px;
+      position: relative;
+    }
+
+    .demo-guidance {
+      background: rgba(15, 23, 42, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      backdrop-filter: blur(16px);
+      padding: 10px 18px;
+      border-radius: 24px;
+      font-size: 13px;
+      color: var(--text-sec);
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+      z-index: 10;
+    }
+
+    .demo-guidance strong {
+      color: var(--accent-blue);
+    }
+
+    .demo-control-btn {
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: var(--text-main);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .demo-control-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+
+    /* ===== Popover Anchor & Window ===== */
+    .popover-anchor {
+      position: relative;
+      display: flex;
+      justify-content: center;
+      width: 100%;
+      max-width: 440px;
+    }
+
+    .popover-notch {
+      position: absolute;
+      top: -6px;
+      width: 14px;
+      height: 14px;
+      background: var(--popover-bg);
+      transform: rotate(45deg);
+      border-left: 1px solid var(--popover-border);
+      border-top: 1px solid var(--popover-border);
+      z-index: 2;
+    }
+
+    .popover-window {
+      width: 100%;
+      background: var(--popover-bg);
+      backdrop-filter: blur(40px) saturate(200%);
+      -webkit-backdrop-filter: blur(40px) saturate(200%);
+      border: 1px solid var(--popover-border);
+      border-radius: 14px;
+      box-shadow: var(--shadow-popover);
+      overflow: hidden;
+      transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.22s ease;
+      z-index: 1;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .popover-window.closed {
+      transform: scale(0.95) translateY(-8px);
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    /* ===== Popover Header ===== */
+    .popover-header {
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--card-border);
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .brand-title {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+    }
+
+    .brand-logo {
+      width: 28px;
+      height: 28px;
+      border-radius: 7px;
+      background: linear-gradient(135deg, #0284c7, #4f46e5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: 800;
+      font-size: 13px;
+      box-shadow: 0 2px 8px rgba(2, 132, 199, 0.3);
+    }
+
+    .brand-text h1 {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      line-height: 1.2;
+    }
+
+    .brand-text p {
+      font-size: 11px;
+      color: var(--text-sec);
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      cursor: pointer;
+    }
+
+    .brand-text p:hover {
+      color: var(--accent-blue);
+    }
+
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent-emerald);
+      box-shadow: 0 0 6px var(--accent-emerald);
+    }
+
+    .status-dot.offline {
+      background: var(--accent-rose);
+      box-shadow: 0 0 6px var(--accent-rose);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .icon-btn {
+      width: 26px;
+      height: 26px;
+      border-radius: 6px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      color: var(--text-sec);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 12px;
+      transition: all 0.15s;
+    }
+
+    .icon-btn:hover {
+      background: var(--card-hover);
+      color: var(--text-main);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .icon-btn.spinning i {
+      display: inline-block;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      100% { transform: rotate(360deg); }
+    }
+
+    /* ===== Remote Server Settings Drawer ===== */
+    .server-settings-drawer {
+      padding: 12px 16px;
+      background: rgba(0, 0, 0, 0.2);
+      border-bottom: 1px solid var(--card-border);
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .server-settings-drawer.open {
+      display: flex;
+    }
+
+    .drawer-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-sec);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .input-field {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .input-field label {
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+
+    .input-field input {
+      width: 100%;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      color: var(--text-main);
+      padding: 5px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      outline: none;
+    }
+
+    .input-field input:focus {
+      border-color: var(--accent-blue);
+      box-shadow: 0 0 0 2px var(--accent-blue-glow);
+    }
+
+    .drawer-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 4px;
+    }
+
+    .drawer-btn {
+      flex: 1;
+      padding: 5px 0;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid var(--card-border);
+      background: var(--card-bg);
+      color: var(--text-main);
+      transition: all 0.15s;
+    }
+
+    .drawer-btn.primary {
+      background: rgba(56, 189, 248, 0.2);
+      border-color: rgba(56, 189, 248, 0.4);
+      color: var(--accent-blue);
+    }
+
+    .drawer-btn:hover {
+      background: var(--card-hover);
+    }
+
+    /* ===== Popover Body ===== */
+    .popover-body {
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 13px;
+      max-height: 520px;
+      overflow-y: auto;
+    }
+
+    .popover-body::-webkit-scrollbar { width: 5px; }
+    .popover-body::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 4px;
+    }
+
+    /* ===== Today's Token Hero Card ===== */
+    .hero-stat-card {
+      background: linear-gradient(145deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.02) 100%);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 13px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero-stat-card::before {
+      content: "";
+      position: absolute;
+      top: -30px;
+      right: -30px;
+      width: 100px;
+      height: 100px;
+      background: radial-gradient(circle, var(--accent-blue-glow) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .hero-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+
+    .section-title {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-sec);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .pill-badge {
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 10px;
+      font-weight: 600;
+      background: rgba(34, 211, 238, 0.12);
+      color: var(--accent-cyan);
+      border: 1px solid rgba(34, 211, 238, 0.25);
+    }
+
+    .token-main-count {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      margin: 3px 0 8px;
+    }
+
+    .token-number {
+      font-family: var(--font-mono);
+      font-size: 25px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      color: #ffffff;
+      text-shadow: 0 2px 10px rgba(56, 189, 248, 0.2);
+    }
+
+    [data-theme="light"] .token-number { color: #0f172a; }
+
+    .token-unit {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-sec);
+    }
+
+    .token-trend {
+      margin-left: auto;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      color: var(--accent-emerald);
+      font-weight: 600;
+    }
+
+    .token-progress-bar {
+      height: 5px;
+      width: 100%;
+      border-radius: 3px;
+      background: rgba(255, 255, 255, 0.06);
+      display: flex;
+      overflow: hidden;
+      margin-bottom: 10px;
+    }
+
+    .token-bar-segment {
+      height: 100%;
+      transition: width 0.4s ease;
+    }
+
+    .bar-input { background: #38bdf8; }
+    .bar-output { background: #c084fc; }
+    .bar-cache { background: #34d399; }
+
+    .token-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      border-top: 1px solid var(--card-border);
+      padding-top: 8px;
+    }
+
+    .token-stat-item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .token-stat-item .stat-label {
+      font-size: 10px;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .stat-label-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 2px;
+    }
+
+    .token-stat-item .stat-val {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-main);
+    }
+
+    /* Quick Performance Pills */
+    .quick-metrics-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 7px;
+    }
+
+    .metric-pill {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 7px 9px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .metric-pill .lbl {
+      font-size: 10px;
+      color: var(--text-sec);
+    }
+
+    .metric-pill .val {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+
+    /* ===== Channel List Section ===== */
+    .channel-section-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 2px;
+    }
+
+    .drag-hint {
+      font-size: 11px;
+      color: var(--text-sec);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .drag-hint span {
+      color: var(--accent-blue);
+      font-weight: 600;
+    }
+
+    .channel-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-height: 80px;
+    }
+
+    .channel-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: grab;
+      transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+      position: relative;
+    }
+
+    .channel-card:active { cursor: grabbing; }
+
+    .channel-card:hover {
+      background: var(--card-hover);
+      border-color: rgba(255, 255, 255, 0.15);
+    }
+
+    .channel-card.dragging {
+      opacity: 0.3;
+      transform: scale(0.98);
+      border: 1px dashed var(--accent-blue);
+    }
+
+    .channel-card.drag-over {
+      border-top: 2px solid var(--accent-blue);
+      background: rgba(56, 189, 248, 0.08);
+    }
+
+    .drag-handle {
+      color: var(--text-muted);
+      font-size: 13px;
+      line-height: 1;
+      padding: 2px;
+      opacity: 0.6;
+    }
+
+    .channel-card:hover .drag-handle {
+      opacity: 1;
+      color: var(--text-sec);
+    }
+
+    .priority-badge {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--text-sec);
+      background: rgba(255, 255, 255, 0.06);
+      border-radius: 4px;
+      padding: 2px 5px;
+      min-width: 22px;
+      text-align: center;
+    }
+
+    .channel-card:first-child .priority-badge {
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent-blue);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+    }
+
+    .channel-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .channel-title-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 2px;
+    }
+
+    .channel-name {
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .provider-tag {
+      font-size: 9px;
+      font-weight: 600;
+      text-transform: uppercase;
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-family: var(--font-mono);
+    }
+
+    .provider-openai { background: rgba(16, 185, 129, 0.15); color: #34d399; }
+    .provider-anthropic { background: rgba(217, 119, 6, 0.15); color: #fbbf24; }
+    .provider-deepseek { background: rgba(99, 102, 241, 0.15); color: #818cf8; }
+    .provider-custom { background: rgba(168, 85, 247, 0.15); color: #c084fc; }
+
+    .channel-meta-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 10px;
+      color: var(--text-sec);
+      font-family: var(--font-mono);
+    }
+
+    .channel-meta-row span {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+    }
+
+    .channel-status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+
+    .status-healthy { background: var(--accent-emerald); }
+    .status-recovering { background: var(--accent-amber); }
+    .status-unhealthy { background: var(--accent-rose); }
+    .status-disabled { background: var(--text-muted); }
+
+    /* Switch toggle */
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 26px;
+      height: 15px;
+      flex-shrink: 0;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: rgba(255, 255, 255, 0.15);
+      transition: .2s;
+      border-radius: 15px;
+    }
+
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 11px;
+      width: 11px;
+      left: 2px;
+      bottom: 2px;
+      background-color: white;
+      transition: .2s;
+      border-radius: 50%;
+    }
+
+    input:checked + .slider { background-color: #10b981; }
+    input:checked + .slider:before { transform: translateX(11px); }
+
+    /* ===== Popover Footer ===== */
+    .popover-footer {
+      padding: 10px 16px;
+      border-top: 1px solid var(--card-border);
+      background: rgba(255, 255, 255, 0.02);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+    }
+
+    .footer-left {
+      color: var(--text-sec);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .gateway-pill {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-main);
+      background: var(--card-bg);
+      padding: 2px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--card-border);
+    }
+
+    .footer-buttons {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .footer-btn {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      color: var(--text-main);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.15s;
+    }
+
+    .footer-btn:hover {
+      background: var(--card-hover);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .footer-btn.primary {
+      background: rgba(56, 189, 248, 0.15);
+      border-color: rgba(56, 189, 248, 0.35);
+      color: var(--accent-blue);
+    }
+
+    /* Toast Notification */
+    .toast-msg {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(50px);
+      background: rgba(15, 23, 42, 0.92);
+      border: 1px solid rgba(56, 189, 248, 0.4);
+      backdrop-filter: blur(12px);
+      color: #ffffff;
+      padding: 8px 16px;
+      border-radius: 20px;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+      z-index: 1000;
+    }
+
+    .toast-msg.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+  </style>
+</head>
+<body data-theme="dark">
+
+  <!-- macOS Top Menu Bar -->
+  <header class="macos-menubar">
+    <div class="menubar-left">
+      <span class="apple-icon"></span>
+      <span class="menubar-item active">Model Bridge</span>
+      <span class="menubar-item">渠道</span>
+      <span class="menubar-item">统计</span>
+      <span class="menubar-item">设置</span>
+    </div>
+
+    <div class="menubar-right">
+      <!-- Our Model Bridge Tray Item (User clickable) -->
+      <div id="trayBtn" class="tray-button active" title="点击展开/收起 Model Bridge 状态面板">
+        <span class="tray-icon-badge">MB</span>
+        <span id="trayPulse" class="tray-pulse"></span>
+        <span id="trayTokens">⚡ 1.28M</span>
+      </div>
+
+      <!-- Native macOS System Icons -->
+      <div class="system-tray-icons">
+        <span title="Wi-Fi">􀙇</span>
+        <span title="电池 100%">􀛨</span>
+        <span title="控制中心">􀜊</span>
+        <span id="clockText">周三 10:52</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Stage / Wallpaper Area -->
+  <main class="desktop-stage">
+
+    <div class="demo-guidance">
+      <span>🌐 <strong>远程部署客户端模式</strong>：可配置远端网关地址与 Admin Token；支持 <strong>跨网关拉取当日 Token 与渠道健康</strong>，并可 <strong>直接拖拽排序实时保存到远端</strong>。</span>
+      <button class="demo-control-btn" id="themeToggleBtn">🌓 切换主题</button>
+      <button class="demo-control-btn" id="drawerToggleBtn">⚙ 远端连接配置</button>
+    </div>
+
+    <!-- Menu Bar Popover Anchor & Window -->
+    <div class="popover-anchor">
+      <div class="popover-notch"></div>
+
+      <div class="popover-window" id="popoverWindow">
+        
+        <!-- Header -->
+        <div class="popover-header">
+          <div class="brand-title">
+            <div class="brand-logo">MB</div>
+            <div class="brand-text">
+              <h1>Model Bridge</h1>
+              <p id="serverEndpointLabel" title="点击配置服务器地址">
+                <span id="statusDot" class="status-dot"></span>
+                <span id="serverUrlText">https://api.model-bridge.io</span> ▾
+              </p>
+            </div>
+          </div>
+          <div class="header-actions">
+            <button class="icon-btn" id="refreshBtn" title="刷新远端数据">
+              <i>↻</i>
+            </button>
+            <button class="icon-btn" id="settingsToggleBtn" title="服务器连接设置">
+              ⚙
+            </button>
+            <button class="icon-btn" id="quitAppBtn" title="退出程序" style="color:var(--text-sec);">
+              ⏻
+            </button>
+            <a class="icon-btn" id="webConsoleLink" href="http://localhost:8080" target="_blank" title="打开远端 Web 控制台">
+              ↗
+            </a>
+          </div>
+        </div>
+
+        <!-- Server Configuration Drawer -->
+        <div class="server-settings-drawer" id="serverDrawer">
+          <div class="drawer-title">
+            <span>远程网关连接设置</span>
+            <span id="connLatencyBadge" style="color:var(--accent-emerald);">延迟: 32ms</span>
+          </div>
+          <div class="input-field">
+            <label>远程网关 API 地址 (Server URL)</label>
+            <input type="text" id="inputServerUrl" value="https://api.model-bridge.io" placeholder="http://ip:8080 或 https://gateway.domain">
+          </div>
+          <div class="input-field">
+            <label>管理员凭证 (Admin Token / Bearer Key)</label>
+            <input type="password" id="inputAdminToken" value="mb-admin-secret-key-889" placeholder="若未开启可留空">
+          </div>
+          <div class="drawer-actions">
+            <button class="drawer-btn primary" id="saveServerBtn">保存并连接</button>
+            <button class="drawer-btn" id="useLocalBtn">设为本地 (localhost:8080)</button>
+          </div>
+        </div>
+
+        <!-- Body Scrollable Content -->
+        <div class="popover-body">
+
+          <!-- Today's Token Hero Card -->
+          <div class="hero-stat-card">
+            <div class="hero-header">
+              <span class="section-title">今日 Token 概览 (Today)</span>
+              <span class="pill-badge" id="cacheHitRateBadge">46.8% Cache Rate</span>
+            </div>
+
+            <div class="token-main-count">
+              <span class="token-number" id="heroTotalTokens">1,284,520</span>
+              <span class="token-unit">Tokens</span>
+              <span class="token-trend" id="tokenTrendText">↑ +18.4%</span>
+            </div>
+
+            <!-- Segmented Progress Bar -->
+            <div class="token-progress-bar">
+              <div class="token-bar-segment bar-input" id="barInput" style="width: 42%;" title="输入 Prompt"></div>
+              <div class="token-bar-segment bar-output" id="barOutput" style="width: 28%;" title="输出 Completion"></div>
+              <div class="token-bar-segment bar-cache" id="barCache" style="width: 30%;" title="缓存读取 Cache Read"></div>
+            </div>
+
+            <!-- Detail Breakdown -->
+            <div class="token-grid">
+              <div class="token-stat-item">
+                <div class="stat-label">
+                  <span class="stat-label-dot" style="background:#38bdf8;"></span> 输入 Prompt
+                </div>
+                <div class="stat-val" id="statInputTokens">542.1K</div>
+              </div>
+              <div class="token-stat-item">
+                <div class="stat-label">
+                  <span class="stat-label-dot" style="background:#c084fc;"></span> 输出 Completion
+                </div>
+                <div class="stat-val" id="statOutputTokens">356.8K</div>
+              </div>
+              <div class="token-stat-item">
+                <div class="stat-label">
+                  <span class="stat-label-dot" style="background:#34d399;"></span> 缓存命中 Read
+                </div>
+                <div class="stat-val" id="statCacheTokens">385.6K</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Channels & Drag-Drop Reorder Section -->
+          <div class="channel-section-header">
+            <span class="section-title">远程渠道与优先级 (Failover Chain)</span>
+            <span class="drag-hint"><span>⠿ 拖拽</span>调整远端调用顺序</span>
+          </div>
+
+          <div class="channel-list" id="channelListContainer">
+            <!-- Channel cards injected by JS with drag and drop -->
+          </div>
+
+        </div>
+
+        <!-- Footer -->
+        <div class="popover-footer">
+          <div class="footer-left">
+            <span>活跃渠道</span>
+            <span class="gateway-pill" id="activeChannelPill">3 / 4 在线</span>
+          </div>
+          <div class="footer-buttons">
+            <button class="footer-btn" id="copyProxyBtn" title="复制远程转发 Endpoint">
+              <span>📋 复制代理 Endpoint</span>
+            </button>
+            <a id="footerWebLink" href="https://api.model-bridge.io" target="_blank" class="footer-btn primary">
+              <span>远端控制台</span> <span>→</span>
+            </a>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Feedback Toast -->
+  <div class="toast-msg" id="toastMsg">
+    <span id="toastIcon">✓</span>
+    <span id="toastText">配置已更新</span>
+  </div>
+
+  <script>
+    // ===== Remote Server State =====
+    let remoteConfig = {
+      serverUrl: localStorage.getItem("mb_remote_url") || "https://api.model-bridge.io",
+      adminToken: localStorage.getItem("mb_admin_token") || "mb-admin-secret-key-889",
+      pollingInterval: 5000,
+      isConnected: true
+    };
+
+    let channels = [
+      {
+        id: "openai-primary",
+        name: "OpenAI 直连 (Azure US)",
+        provider: "openai",
+        priority: 1,
+        enabled: true,
+        state: "healthy",
+        avgLatency: 210,
+        requestsToday: 890,
+        tokensToday: "720.5K",
+        successRate: 99.8
+      },
+      {
+        id: "anthropic-main",
+        name: "Anthropic Claude (AWS Bedrock)",
+        provider: "anthropic",
+        priority: 2,
+        enabled: true,
+        state: "healthy",
+        avgLatency: 340,
+        requestsToday: 412,
+        tokensToday: "410.2K",
+        successRate: 99.2
+      },
+      {
+        id: "deepseek-api",
+        name: "DeepSeek API (HK Cluster)",
+        provider: "deepseek",
+        priority: 3,
+        enabled: true,
+        state: "healthy",
+        avgLatency: 180,
+        requestsToday: 126,
+        tokensToday: "153.8K",
+        successRate: 98.6
+      },
+      {
+        id: "custom-fallback",
+        name: "本地备用应急通道",
+        provider: "custom",
+        priority: 4,
+        enabled: false,
+        state: "disabled",
+        avgLatency: 520,
+        requestsToday: 0,
+        tokensToday: "0",
+        successRate: 100
+      }
+    ];
+
+    let stats = {
+      totalTokens: 1284520,
+      inputTokens: 542100,
+      outputTokens: 356820,
+      cacheTokens: 385600,
+      totalRequests: 1428,
+      avgLatency: 245,
+      successRate: 99.4
+    };
+
+    let isPopoverOpen = true;
+    let isDrawerOpen = false;
+    let pollTimer = null;
+
+    // ===== Elements =====
+    const trayBtn = document.getElementById("trayBtn");
+    const trayPulse = document.getElementById("trayPulse");
+    const popoverWindow = document.getElementById("popoverWindow");
+    const channelListContainer = document.getElementById("channelListContainer");
+    const trayTokensEl = document.getElementById("trayTokens");
+    const heroTotalTokensEl = document.getElementById("heroTotalTokens");
+    const statInputTokensEl = document.getElementById("statInputTokens");
+    const statOutputTokensEl = document.getElementById("statOutputTokens");
+    const statCacheTokensEl = document.getElementById("statCacheTokens");
+    const statTotalRequestsEl = document.getElementById("statTotalRequests");
+    const statAvgLatencyEl = document.getElementById("statAvgLatency");
+    const statSuccessRateEl = document.getElementById("statSuccessRate");
+    const cacheHitRateBadge = document.getElementById("cacheHitRateBadge");
+    const barInput = document.getElementById("barInput");
+    const barOutput = document.getElementById("barOutput");
+    const barCache = document.getElementById("barCache");
+    const activeChannelPill = document.getElementById("activeChannelPill");
+    const toastMsg = document.getElementById("toastMsg");
+    const toastText = document.getElementById("toastText");
+    const refreshBtn = document.getElementById("refreshBtn");
+    const themeToggleBtn = document.getElementById("themeToggleBtn");
+    const drawerToggleBtn = document.getElementById("drawerToggleBtn");
+    const settingsToggleBtn = document.getElementById("settingsToggleBtn");
+    const serverEndpointLabel = document.getElementById("serverEndpointLabel");
+    const serverDrawer = document.getElementById("serverDrawer");
+    const inputServerUrl = document.getElementById("inputServerUrl");
+    const inputAdminToken = document.getElementById("inputAdminToken");
+    const saveServerBtn = document.getElementById("saveServerBtn");
+    const useLocalBtn = document.getElementById("useLocalBtn");
+    const serverUrlText = document.getElementById("serverUrlText");
+    const statusDot = document.getElementById("statusDot");
+    const clockText = document.getElementById("clockText");
+    const copyProxyBtn = document.getElementById("copyProxyBtn");
+    const webConsoleLink = document.getElementById("webConsoleLink");
+    const footerWebLink = document.getElementById("footerWebLink");
+
+    // ===== Helpers =====
+    function formatTokens(n) {
+      if (n >= 1000000000) return (n / 1000000000).toFixed(2) + 'B';
+      if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+      if (n >= 10000) return (n / 1000).toFixed(1) + 'K';
+      return n.toLocaleString();
+    }
+
+    function showToast(msg) {
+      toastText.textContent = msg;
+      toastMsg.classList.add("show");
+      setTimeout(() => {
+        toastMsg.classList.remove("show");
+      }, 2200);
+    }
+
+    function updateClock() {
+      const now = new Date();
+      const days = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+      const day = days[now.getDay()];
+      const hours = String(now.getHours()).padStart(2, '0');
+      const mins = String(now.getMinutes()).padStart(2, '0');
+      clockText.textContent = `${day} ${hours}:${mins}`;
+    }
+    updateClock();
+    setInterval(updateClock, 30000);
+
+    // ===== Render UI =====
+    function renderStats() {
+      trayTokensEl.textContent = `⚡ ${formatTokens(stats.totalTokens)}`;
+      heroTotalTokensEl.innerHTML = `${formatTokens(stats.totalTokens)} <span style="font-size:12px;font-weight:400;color:var(--text-sec);font-family:var(--font-mono);margin-left:4px;">(${stats.totalTokens.toLocaleString()})</span>`;
+      statInputTokensEl.textContent = formatTokens(stats.inputTokens);
+      statOutputTokensEl.textContent = formatTokens(stats.outputTokens);
+      statCacheTokensEl.textContent = formatTokens(stats.cacheTokens);
+      statTotalRequestsEl.textContent = `${stats.totalRequests.toLocaleString()} 次`;
+      statAvgLatencyEl.textContent = `${stats.avgLatency} ms`;
+      statSuccessRateEl.textContent = `${stats.successRate}%`;
+
+      const total = stats.inputTokens + stats.outputTokens + stats.cacheTokens;
+      if (total > 0) {
+        const inPct = ((stats.inputTokens / total) * 100).toFixed(1);
+        const outPct = ((stats.outputTokens / total) * 100).toFixed(1);
+        const cachePct = (100 - inPct - outPct).toFixed(1);
+        barInput.style.width = inPct + '%';
+        barOutput.style.width = outPct + '%';
+        barCache.style.width = cachePct + '%';
+
+        const cacheRate = ((stats.cacheTokens / (stats.inputTokens + stats.cacheTokens)) * 100).toFixed(1);
+        cacheHitRateBadge.textContent = `${cacheRate}% Cache Rate`;
+      }
+
+      const activeCount = channels.filter(c => c.enabled).length;
+      activeChannelPill.textContent = `${activeCount} / ${channels.length} 在线`;
+    }
+
+    function renderChannels() {
+      channelListContainer.innerHTML = "";
+
+      channels.sort((a, b) => a.priority - b.priority).forEach((ch, idx) => {
+        const card = document.createElement("div");
+        card.className = `channel-card ${!ch.enabled ? "opacity-60" : ""}`;
+        card.setAttribute("draggable", "true");
+        card.dataset.id = ch.id;
+        card.dataset.index = idx;
+
+        const providerClass = `provider-${ch.provider || 'custom'}`;
+        const statusClass = `status-${ch.enabled ? (ch.state || 'healthy') : 'disabled'}`;
+
+        card.innerHTML = `
+          <span class="drag-handle" title="按住拖拽调整远端优先级">⠿</span>
+          <div class="channel-info">
+            <div class="channel-title-row">
+              <span class="channel-status-dot ${statusClass}" title="状态: ${ch.state}"></span>
+              <span class="channel-name">${ch.name}</span>
+              <span class="provider-tag ${providerClass}">${ch.provider}</span>
+            </div>
+            <div class="channel-meta-row">
+              <span>⏱ ${ch.avgLatency}ms</span>
+              <span>•</span>
+              <span>${ch.tokensToday} tok</span>
+              <span>•</span>
+              <span>${ch.requestsToday} req</span>
+            </div>
+          </div>
+          <label class="switch" title="${ch.enabled ? '已启用' : '已停用'}">
+            <input type="checkbox" ${ch.enabled ? 'checked' : ''} data-channel-id="${ch.id}" class="channel-toggle">
+            <span class="slider"></span>
+          </label>
+        `;
+
+        setupCardDragEvents(card, idx);
+        channelListContainer.appendChild(card);
+      });
+
+      // Toggle switch event listener
+      channelListContainer.querySelectorAll(".channel-toggle").forEach(input => {
+        input.addEventListener("change", async (e) => {
+          const chId = e.target.dataset.channelId;
+          const targetCh = channels.find(c => c.id === chId);
+          if (targetCh) {
+            targetCh.enabled = e.target.checked;
+            showToast(`远端同步中: ${targetCh.name} 已${targetCh.enabled ? '启用' : '停用'}`);
+            renderChannels();
+            renderStats();
+            // Dispatch to remote server
+            await syncChannelUpdate(targetCh);
+          }
+        });
+      });
+    }
+
+    // ===== Drag & Drop Implementation =====
+    let draggedIndex = null;
+
+    function setupCardDragEvents(card, idx) {
+      card.addEventListener("dragstart", (e) => {
+        draggedIndex = idx;
+        card.classList.add("dragging");
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", idx);
+      });
+
+      card.addEventListener("dragend", () => {
+        card.classList.remove("dragging");
+        document.querySelectorAll(".channel-card").forEach(el => {
+          el.classList.remove("drag-over");
+        });
+      });
+
+      card.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        if (draggedIndex === null || draggedIndex === idx) return;
+        card.classList.add("drag-over");
+      });
+
+      card.addEventListener("dragleave", () => {
+        card.classList.remove("drag-over");
+      });
+
+      card.addEventListener("drop", async (e) => {
+        e.preventDefault();
+        card.classList.remove("drag-over");
+        if (draggedIndex === null || draggedIndex === idx) return;
+
+        // Perform reorder
+        const movedItem = channels.splice(draggedIndex, 1)[0];
+        channels.splice(idx, 0, movedItem);
+
+        // Update priorities
+        channels.forEach((c, i) => {
+          c.priority = i + 1;
+        });
+
+        draggedIndex = null;
+        renderChannels();
+        showToast(`已更新远端优先级: ${movedItem.name} ➔ P${idx + 1}`);
+
+        // Push priority update to remote server
+        await syncAllChannelPriorities();
+      });
+    }
+
+    // ===== Remote Server Sync Logic =====
+    async function fetchRemoteData() {
+      const baseUrl = remoteConfig.serverUrl.replace(/\/+$/, '');
+      const headers = { 'Content-Type': 'application/json' };
+      if (remoteConfig.adminToken) {
+        headers['Authorization'] = `Bearer ${remoteConfig.adminToken}`;
+      }
+
+      try {
+        const statsRes = await fetch(`${baseUrl}/api/stats?period=today`, { headers });
+        if (statsRes.ok) {
+          const data = await statsRes.json();
+          stats.totalRequests = data.total_requests || stats.totalRequests;
+          stats.inputTokens = data.input_tokens || stats.inputTokens;
+          stats.outputTokens = data.output_tokens || stats.outputTokens;
+          stats.cacheTokens = data.cache_read_tokens || stats.cacheTokens;
+          stats.totalTokens = stats.inputTokens + stats.outputTokens + stats.cacheTokens;
+          setConnected(true);
+        }
+      } catch (err) {
+        // If remote is offline or unreachable in demo, fallback to soft live simulation
+        simulateTick();
+      }
+    }
+
+    async function syncChannelUpdate(channel) {
+      const baseUrl = remoteConfig.serverUrl.replace(/\/+$/, '');
+      const headers = { 'Content-Type': 'application/json' };
+      if (remoteConfig.adminToken) {
+        headers['Authorization'] = `Bearer ${remoteConfig.adminToken}`;
+      }
+      try {
+        await fetch(`${baseUrl}/api/config/channel`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(channel)
+        });
+      } catch (e) {
+        console.warn("Remote sync simulated:", e);
+      }
+    }
+
+    async function syncAllChannelPriorities() {
+      const baseUrl = remoteConfig.serverUrl.replace(/\/+$/, '');
+      const headers = { 'Content-Type': 'application/json' };
+      if (remoteConfig.adminToken) {
+        headers['Authorization'] = `Bearer ${remoteConfig.adminToken}`;
+      }
+      try {
+        await Promise.all(channels.map(ch =>
+          fetch(`${baseUrl}/api/config/channel`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(ch)
+          })
+        ));
+      } catch (e) {
+        console.warn("Priority sync simulated:", e);
+      }
+    }
+
+    function setConnected(connected) {
+      remoteConfig.isConnected = connected;
+      if (connected) {
+        statusDot.className = "status-dot";
+        trayPulse.className = "tray-pulse";
+      } else {
+        statusDot.className = "status-dot offline";
+        trayPulse.className = "tray-pulse offline";
+      }
+    }
+
+    function simulateTick() {
+      const addPrompt = Math.floor(Math.random() * 140 + 30);
+      const addComp = Math.floor(Math.random() * 90 + 15);
+      const addCache = Math.floor(Math.random() * 70 + 10);
+      stats.inputTokens += addPrompt;
+      stats.outputTokens += addComp;
+      stats.cacheTokens += addCache;
+      stats.totalTokens += (addPrompt + addComp + addCache);
+      if (Math.random() > 0.5) stats.totalRequests += 1;
+      renderStats();
+    }
+
+    // ===== UI Controls & Toggles =====
+    function toggleDrawer(open) {
+      isDrawerOpen = typeof open === "boolean" ? open : !isDrawerOpen;
+      if (isDrawerOpen) {
+        serverDrawer.classList.add("open");
+        inputServerUrl.value = remoteConfig.serverUrl;
+        inputAdminToken.value = remoteConfig.adminToken;
+      } else {
+        serverDrawer.classList.remove("open");
+      }
+    }
+
+    trayBtn.addEventListener("click", () => {
+      isPopoverOpen = !isPopoverOpen;
+      if (isPopoverOpen) {
+        popoverWindow.classList.remove("closed");
+        trayBtn.classList.add("active");
+      } else {
+        popoverWindow.classList.add("closed");
+        trayBtn.classList.remove("active");
+      }
+    });
+
+    settingsToggleBtn.addEventListener("click", () => toggleDrawer());
+    serverEndpointLabel.addEventListener("click", () => toggleDrawer());
+    drawerToggleBtn.addEventListener("click", () => toggleDrawer());
+
+    const quitAppBtn = document.getElementById("quitAppBtn");
+    if (quitAppBtn) {
+      quitAppBtn.addEventListener("click", () => {
+        showToast("已触发退出程序 (NSApplication.shared.terminate)");
+      });
+    }
+
+    saveServerBtn.addEventListener("click", () => {
+      const url = inputServerUrl.value.trim();
+      const token = inputAdminToken.value.trim();
+      if (!url) {
+        showToast("请输入有效的服务器地址");
+        return;
+      }
+      remoteConfig.serverUrl = url;
+      remoteConfig.adminToken = token;
+      localStorage.setItem("mb_remote_url", url);
+      localStorage.setItem("mb_admin_token", token);
+
+      serverUrlText.textContent = url.replace(/^https?:\/\//, '');
+      webConsoleLink.href = url;
+      footerWebLink.href = url;
+
+      toggleDrawer(false);
+      showToast(`已连接至远端: ${url}`);
+      refreshBtn.click();
+    });
+
+    useLocalBtn.addEventListener("click", () => {
+      inputServerUrl.value = "http://localhost:8080";
+      inputAdminToken.value = "";
+      saveServerBtn.click();
+    });
+
+    themeToggleBtn.addEventListener("click", () => {
+      const current = document.body.getAttribute("data-theme");
+      const next = current === "dark" ? "light" : "dark";
+      document.body.setAttribute("data-theme", next);
+      showToast(`已切换至 ${next === 'dark' ? '暗色' : '亮色'} 模式`);
+    });
+
+    copyProxyBtn.addEventListener("click", () => {
+      const proxyUrl = `${remoteConfig.serverUrl.replace(/\/+$/, '')}/v1/chat/completions`;
+      navigator.clipboard.writeText(proxyUrl).then(() => {
+        showToast(`已复制代理地址: ${proxyUrl}`);
+      });
+    });
+
+    refreshBtn.addEventListener("click", async () => {
+      refreshBtn.classList.add("spinning");
+      await fetchRemoteData();
+      setTimeout(() => {
+        refreshBtn.classList.remove("spinning");
+        renderStats();
+        showToast("远端数据已刷新");
+      }, 400);
+    });
+
+    // Initialize
+    inputServerUrl.value = remoteConfig.serverUrl;
+    inputAdminToken.value = remoteConfig.adminToken;
+    serverUrlText.textContent = remoteConfig.serverUrl.replace(/^https?:\/\//, '');
+    webConsoleLink.href = remoteConfig.serverUrl;
+    footerWebLink.href = remoteConfig.serverUrl;
+
+    renderStats();
+    renderChannels();
+
+    // Start background poll
+    pollTimer = setInterval(() => {
+      fetchRemoteData();
+    }, remoteConfig.pollingInterval);
+  </script>
+</body>
+</html>

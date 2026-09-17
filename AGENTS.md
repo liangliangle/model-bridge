@@ -8,8 +8,14 @@ providing protocol conversion, channel failover, MCP relay, and cost tracking.
 It accepts three client protocols — OpenAI Chat Completions, OpenAI Responses, and Anthropic
 Messages — and routes to channels that speak any of those three.
 
-A Go reimplementation is in progress on the `feat/go-override` branch. The Rust implementation
-on `main` is the behavior reference: treat it as the oracle and keep it green.
+Two backends implement the same behavior and share the same HTTP contract:
+
+- `src-tauri/` — the original Rust backend (axum, tokio, rusqlite) on `main`.
+- `go/` — the Go backend, delivered on `feat/go-override`. It is the one to evolve going forward.
+
+Both serve the same config file (`~/.model-bridge/config.yaml`), the same admin API, and the same
+proxy endpoints, so the frontend in `src/` and the macOS client work with either one unchanged.
+Where the two disagree, the Rust implementation is the behavior reference: treat it as the oracle.
 
 ## Protocol Conversion Matrix
 
@@ -56,6 +62,19 @@ Invariants:
   - `provider/` — provider adapters and forwarded headers
   - `commands.rs` — admin HTTP API, consumed by the web UI and the macOS client
   - `static_files.rs` — serves the frontend embedded at compile time
+- `go/` — Go backend (module `modelbridge`), behavior-compatible with `src-tauri/`
+  - `cmd/model-bridge/` — entry point: config load, audit DB, health checker, HTTP listen
+  - `internal/converter/` — protocol conversion (largest module; see the matrix above)
+  - `internal/proxy/` — `server.go` (routes), `router.go` (selection, audit, failover loop),
+    `executor.go` (per-channel execution, streaming error detection), `context.go`
+  - `internal/channel/` — health tracking / circuit breaker, `failover.go` routing
+  - `internal/audit/` — SQLite audit log; `assemble.go` rebuilds a readable response object
+    from a raw SSE stream for the detail view
+  - `internal/api/` — the `/api/*` admin handlers
+  - `internal/mcp/` — MCP relay (OAuth 2.1, tool filtering, header injection)
+  - `internal/cost/`, `internal/config/`, `internal/web/` — pricing, config, embedded frontend
+  - `e2e/` — end-to-end tests driving the real HTTP server against a mock upstream
+  - `docs/go-rewrite/feature-inventory.md` — the frozen contract inventory the rewrite was built to
 - `macos-client/` — SwiftUI menu bar client; talks to the admin HTTP API (independent build)
 - `public/` — static assets
 - `config.example.yaml` — reference configuration file
@@ -71,9 +90,17 @@ Invariants:
 | `cd src-tauri && cargo build --release` | Build Rust backend (release) |
 | `cd src-tauri && cargo run` | Run backend locally |
 | `./build.sh` | Full release build: frontend + backend → single binary in `release/` |
+| `cd go && ./build.sh` | Sync `dist/` into the Go module and build `go/bin/model-bridge` |
+| `cd go && go build -p 1 ./...` | Build the Go backend (serial: this machine has little RAM) |
+| `cd go && go test -p 1 ./...` | Run Go unit + end-to-end tests |
+| `cd go && ./scripts/verify-startup.sh` | Start the real binary twice and diff its responses |
+| `cd go && ./bin/model-bridge` | Run the Go backend locally |
 
 **Build order matters.** `build.rs` embeds `dist/` into the binary via `include_bytes!`, so
-`pnpm build` must run *before* `cargo build`. The generated `embedded_assets.rs` records absolute
+`pnpm build` must run *before* `cargo build`. The Go module has the same constraint for a
+different reason: `//go:embed` cannot reference files outside the module directory, so
+`go/build.sh` copies the repo's `dist/` into `go/internal/web/dist/` before compiling. That copy
+is committed so a fresh clone can build without running the frontend build first. The generated `embedded_assets.rs` records absolute
 paths, so if the checkout moves, `cargo test` fails with `couldn't read .../dist/...` — run
 `touch build.rs` to force the build script to regenerate.
 
@@ -109,6 +136,29 @@ Guidelines:
 - Tests must be hermetic: no `/tmp` scratch files, no network, no dependence on cwd.
 
 No frontend test framework is configured yet; `vitest` is the suggested choice if adding one.
+
+### Go backend
+
+Run with `cd go && go test -p 1 ./...`. Always pass `-p 1` — this environment has ~570 MiB of free
+RAM and parallel compilation gets OOM-killed.
+
+| Package | Covers |
+|---|---|
+| `internal/converter` | request/response/stream mapping for both directions, namespace round-trip, SSE framing at every byte offset |
+| `internal/channel` | protocol-matrix filtering, priority ordering, candidate cap, circuit breaker |
+| `internal/audit` | rebuilding a readable response object from raw SSE (Anthropic / Chat / Responses) |
+| `internal/api` | every admin endpoint against a real config file and a real SQLite DB |
+| `e2e` | the real HTTP server driven by a mock upstream: non-stream and stream for all three entries, failover ordering, MCP tool filtering, audit/cost persistence |
+
+Guidelines:
+
+- `e2e` tests must exercise the real path — build the app with `proxy.NewServer`, point channels at
+  the mock upstream, and assert on the bytes that reach the upstream and the bytes sent downstream.
+  Do not assert on internals or hardcode expected values that restate the implementation.
+- Evidence goes to the directory named by `$SCRATCH`; tests skip evidence writes when it is unset
+  but still run every assertion.
+- `mock_upstream.go` answers in all three protocols and records every request, so a test can prove
+  what was actually forwarded (e.g. `stream_options.include_usage`, `model` rewriting).
 
 ## Commit & PR Guidelines
 
