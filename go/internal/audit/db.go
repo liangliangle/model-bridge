@@ -530,19 +530,32 @@ type Stats struct {
 	CostUsd             float64 `json:"cost_usd"`
 }
 
-// periodCutoffMs 按本地时区的自然日起点计算 cutoff。
-func periodCutoffMs(period string) int64 {
+// localMidnightDaysAgo 返回「本地时区、days 天前的自然日零点」。
+//
+// 聚合类查询的窗口下界都是它：统计要的是自然日边界，而不是「now 减去 N×24h」
+// （后者会在夏令时切换或跨零点时切错天）。
+func localMidnightDaysAgo(days int) time.Time {
 	now := time.Now()
-	daysBack := 0
+	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	return midnight.AddDate(0, 0, -days)
+}
+
+// periodCutoffMs 把 **/api/stats 的周期**（today / 7d / 30d）转成时间下界（毫秒）。
+//
+// 只接受这三个取值，未知取值按 today 处理（与既有行为一致）。
+//
+// 注意：这里的参数是「周期字符串」，不是「任意天数」。历史上 GetTokenHeatmap 曾把
+// 天数拼成 "365d" 传进来，落进 default 分支 → cutoff 塌缩成今天零点 → 查询结果为空
+// （只有 7/30 碰巧正确）。要按天数取窗口请直接用 localMidnightDaysAgo。
+func periodCutoffMs(period string) int64 {
 	switch period {
 	case "7d":
-		daysBack = 7
+		return localMidnightDaysAgo(7).UnixMilli()
 	case "30d":
-		daysBack = 30
+		return localMidnightDaysAgo(30).UnixMilli()
+	default: // today（以及未知取值）
+		return localMidnightDaysAgo(0).UnixMilli()
 	}
-	target := now.AddDate(0, 0, -daysBack)
-	midnight := time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, time.Local)
-	return midnight.UnixMilli()
 }
 
 // GetStats 统计概览，按 period（today/7d/30d）与可选渠道过滤。
@@ -584,12 +597,16 @@ type DailyHeat struct {
 	Tokens uint64 `json:"tokens"`
 }
 
-// GetTokenHeatmap 返回最近 days 天的按天 token 聚合。
+// GetTokenHeatmap 返回最近 days 天的按天 token 聚合（稀疏：只含有记录的日期）。
+//
+// cutoff 由**天数**直接推出（本地自然日零点往回 days 天），与 Rust
+// `get_token_heatmap` 的算法一致。不要改走 periodCutoffMs——那个函数只认
+// today / 7d / 30d，天数传进去会落进默认分支让窗口塌缩成「今天」。
 func (d *DB) GetTokenHeatmap(days uint32) ([]DailyHeat, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	cutoff := periodCutoffMs(fmt.Sprintf("%dd", days))
+	cutoff := localMidnightDaysAgo(int(days)).UnixMilli()
 	rows, err := d.conn.Query(
 		`SELECT date(timestamp/1000, 'unixepoch', 'localtime') AS day,
 		        COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)+
