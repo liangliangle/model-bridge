@@ -9,42 +9,38 @@ import (
 // 本文件覆盖 Hop 这一层门面：方向由「下游协议 + 上游协议」一次确定，
 // 请求与响应共用同一个对象。重点回归的是「方向写反」这个曾经真实发生的缺陷。
 
-// TestNewHopCarriesPlan 固定 Hop 与路径规划的关系：任意组合都能构造，
-// 角色（客户端/渠道）取回正确，跳数由协议组合决定（路径细节见 plan_test.go）。
-func TestNewHopCarriesPlan(t *testing.T) {
+func TestNewHopValidatesMatrix(t *testing.T) {
 	// 同协议：合法的透传方向。
-	hop := NewHop(FormatOpenAIChat.AsClient(), FormatOpenAIChat.AsChannel())
+	hop, err := NewHop(FormatOpenAIChat.AsClient(), FormatOpenAIChat.AsChannel())
+	if err != nil {
+		t.Fatalf("chat → chat: %v", err)
+	}
 	if hop.Converts() {
 		t.Fatalf("同协议不应要求转换")
 	}
 	if hop.Client() != FormatOpenAIChat || hop.Channel() != FormatOpenAIChat {
 		t.Fatalf("角色取回错误: client=%v channel=%v", hop.Client(), hop.Channel())
 	}
-	if hops := hop.Plan().Hops(); hops != 0 {
-		t.Fatalf("同协议跳数 = %d, want 0", hops)
-	}
 
-	// 渠道是转换枢纽：单跳。
+	// 渠道是转换枢纽：合法。
 	for _, c := range []ApiFormat{FormatAnthropic, FormatResponses} {
-		hop := NewHop(c.AsClient(), FormatOpenAIChat.AsChannel())
+		hop, err := NewHop(c.AsClient(), FormatOpenAIChat.AsChannel())
+		if err != nil {
+			t.Fatalf("%v → chat: %v", c, err)
+		}
 		if !hop.Converts() {
 			t.Fatalf("%v → chat 应当要求转换", c)
 		}
-		if hops := hop.Plan().Hops(); hops != 1 {
-			t.Fatalf("%v → chat 跳数 = %d, want 1", c, hops)
-		}
 	}
 
-	// 两个富协议之间：经 Chat 两跳（矩阵全开后不再是错误）。
-	hop = NewHop(FormatAnthropic.AsClient(), FormatResponses.AsChannel())
-	if !hop.Converts() {
-		t.Fatalf("messages → responses 应当要求转换")
+	// 矩阵外：两个方向都必须拒绝。把上下游写反正是走到这里的路径之一。
+	if _, err := NewHop(FormatAnthropic.AsClient(), FormatResponses.AsChannel()); err == nil {
+		t.Fatalf("messages → responses 必须返回 *UnsupportedConversion")
+	} else if _, ok := err.(*UnsupportedConversion); !ok {
+		t.Fatalf("错误类型 = %T, want *UnsupportedConversion", err)
 	}
-	if hops := hop.Plan().Hops(); hops != 2 {
-		t.Fatalf("messages → responses 跳数 = %d, want 2", hops)
-	}
-	if got := hop.Plan().String(); got != "messages -> chat -> responses" {
-		t.Fatalf("路径 = %q", got)
+	if _, err := NewHop(FormatOpenAIChat.AsClient(), FormatAnthropic.AsChannel()); err == nil {
+		t.Fatalf("chat → messages 必须返回 *UnsupportedConversion")
 	}
 }
 
@@ -52,7 +48,10 @@ func TestNewHopCarriesPlan(t *testing.T) {
 // 入口是 messages、渠道是 chat，Hop 的响应转换必须产出 Anthropic 形态，
 // 而不是把方向写成「上游 → 下游」后原样吐出 chat.completion。
 func TestHopResponseDirection(t *testing.T) {
-	hop := NewHop(FormatAnthropic.AsClient(), FormatOpenAIChat.AsChannel())
+	hop, err := NewHop(FormatAnthropic.AsClient(), FormatOpenAIChat.AsChannel())
+	if err != nil {
+		t.Fatalf("NewHop: %v", err)
+	}
 
 	// 请求方向：messages → chat。
 	upstream, err := hop.BuildUpstreamRequest([]byte(`{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`), RequestOptions{Model: "up"})
@@ -107,7 +106,10 @@ func TestHopReplayAndPassthrough(t *testing.T) {
 	chat := []byte(`{"id":"c1","model":"up","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)
 
 	// 跨协议：重放为入口协议（responses）的事件流。
-	hop := NewHop(FormatResponses.AsClient(), FormatOpenAIChat.AsChannel())
+	hop, err := NewHop(FormatResponses.AsClient(), FormatOpenAIChat.AsChannel())
+	if err != nil {
+		t.Fatalf("NewHop: %v", err)
+	}
 	raw, err := hop.ReplayResponseAsSSE(chat, "gpt-5")
 	if err != nil {
 		t.Fatalf("ReplayResponseAsSSE: %v", err)
@@ -118,7 +120,10 @@ func TestHopReplayAndPassthrough(t *testing.T) {
 	}
 
 	// 同协议：不转换，按入口格式重放（chat）。
-	same := NewHop(FormatOpenAIChat.AsClient(), FormatOpenAIChat.AsChannel())
+	same, err := NewHop(FormatOpenAIChat.AsClient(), FormatOpenAIChat.AsChannel())
+	if err != nil {
+		t.Fatalf("NewHop: %v", err)
+	}
 	raw, err = same.ReplayResponseAsSSE(chat, "gpt-4o")
 	if err != nil {
 		t.Fatalf("ReplayResponseAsSSE(chat→chat): %v", err)

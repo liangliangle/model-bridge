@@ -352,34 +352,6 @@ func (u *streamUsage) toResponsesUsage() map[string]any {
 	return out
 }
 
-// toChatUsage 输出 Chat 形态的 usage。
-//
-// 与 toResponsesUsage 同理：Chat 的 prompt_tokens **含**缓存命中，而 mergeChat /
-// mergeAnthropic / mergeResponses 在累加时把命中量扣到了 cacheRead 里，
-// 因此这里要加回去（数学与 anthropicUsageToChat 完全一致，两跳时才不会重复扣）。
-func (u *streamUsage) toChatUsage() map[string]any {
-	cached := derefInt(u.cacheReadTokens)
-	creation := derefInt(u.cacheCreationTokens)
-	prompt := derefInt(u.inputTokens) + cached + creation
-	completion := derefInt(u.outputTokens)
-	out := map[string]any{
-		"prompt_tokens":     prompt,
-		"completion_tokens": completion,
-		"total_tokens":      prompt + completion,
-	}
-	details := map[string]any{}
-	if cached > 0 {
-		details["cached_tokens"] = cached
-	}
-	if creation > 0 {
-		details["cache_creation_tokens"] = creation
-	}
-	if len(details) > 0 {
-		out["prompt_tokens_details"] = details
-	}
-	return out
-}
-
 // usage 把累加器导出为对外 Usage（Anthropic 口径，见 Usage 注释）。
 func (u *streamUsage) usage() Usage {
 	return Usage{

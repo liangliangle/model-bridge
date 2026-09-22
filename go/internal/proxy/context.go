@@ -79,3 +79,16 @@ func NewRequestContext(format converter.ApiFormat, path string, headers http.Hea
 
 // ProtocolName 返回入口协议名，用于错误提示与日志。
 func (c *RequestContext) ProtocolName() string { return c.Format.String() }
+
+// AllowedProviderHint 描述该入口协议下渠道侧允许的协议类型，
+// 用于「无可用渠道」的错误提示。与 Rust `InputFormat::allowed_provider_hint` 一致。
+func AllowedProviderHint(f converter.ApiFormat) string {
+	switch f {
+	case converter.FormatOpenAIChat:
+		return "a chat channel"
+	case converter.FormatAnthropic:
+		return "a messages or chat channel"
+	default:
+		return "a responses or chat channel"
+	}
+}

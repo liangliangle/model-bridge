@@ -43,21 +43,6 @@
 
 > **与 OBJECTIVE 的偏差，需记录**：OBJECTIVE 要求「协议转换完全照抄 ocgo」。ocgo 的矩阵更宽（含 Responses→Anthropic 两跳、Chat→Anthropic），且 ocgo 无渠道概念。本清单以「照抄 ocgo 的**映射函数**」为界，矩阵与渠道路由保留本仓库现状。详见 `## Deviations`（写入规划文件）。
 
-#### 1.1-b 变更记录：矩阵全开（Go 侧，2026-09）
-
-上表是**重写时的冻结契约**（Rust 侧行为），保留作历史对照。此后 Go 侧按需求把矩阵放开为**任意协议互转**：
-
-| 请求方（入口） | Chat 渠道 | Messages 渠道 | Responses 渠道 |
-|---|---|---|---|
-| Chat | 透传 | 单跳 | 单跳 |
-| Messages | 单跳 | 透传 | **两跳（经 Chat）** |
-| Responses | 单跳 | **两跳（经 Chat）** | 透传 |
-
-- 实现方式：新增 4 个单向映射（请求 `chat→messages` / `chat→responses`，响应 `messages→chat` / `responses→chat`）与 2 条逆向流式方向，任意组合都是这些原语的复合；路径由 `converter.NewPlan` 规划（0/1/2 跳）。
-- 路由语义变化：**协议不再参与渠道决策**，候选只按 `priority` 排序（原「先按矩阵硬过滤」已删除）。`RouteUnsupportedProtocol` 保留但不可达。
-- 已知有损与两档处理（拒绝 / 丢弃并记日志）见 `README.md` 的「有损清单」。
-- 与上表相比，Rust 侧「不支持」的四格现在都可用，其中两格为两跳。
-
 ### 1.2 转换实现（照抄来源：`ocgo/cmd/ocgo/main.go`）
 
 | ocgo 函数 | 行号 | Go 重写对应 |
@@ -164,14 +149,14 @@
 
 - 渠道字段：`id`, `name`, `provider`(`openai`/`openai_responses`/`anthropic`), `endpoint.url`, `api_key`, `priority`（数值小者优先）, `enabled`, `fallback_model`, `model_mapping`, `timeout_ms`, `rate_limit`, `custom_headers`, `strip_thinking`, `retry_count`, `retry_delay_ms`, `force_effort`, `auto_cache`
 - 拖拽调整优先级；模型映射表编辑
-- 路由顺序：**只按 `priority`**（相同则保持配置顺序）。协议不参与渠道决策（矩阵全开后任意协议组合都能服务；见 §1.1-b）
+- 路由顺序：**先按协议矩阵硬过滤**，剩余候选**严格按 `priority`**（相同则保持配置顺序）
 
 ### 4.2 故障转移与熔断（`/settings` 的故障转移区）
 
 - `failover.max_failover_channels`：单次请求最多尝试几个渠道；`0` = 不限制（**非**重试次数）
 - `channels[].retry_count` + `retry_delay_ms`：单渠道内重试
 - 熔断器：`failure_threshold`、`recovery_interval_sec`、`probe_requests`；状态 `Healthy`/`Degraded`/`Unhealthy`/`Recovering`
-- `ultimate_fallback.channel`：全部失败后的最终兜底（不看协议，只看渠道是否存在）
+- `ultimate_fallback.channel`：全部失败后的最终兜底（同样受协议矩阵约束）
 
 ### 4.3 审计日志（`/audit`）
 

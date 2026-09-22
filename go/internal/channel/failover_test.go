@@ -81,39 +81,54 @@ func assertEqual(t *testing.T, got, want []string, label string) {
 	}
 }
 
-// ==================== 渠道选择：协议不参与 ====================
+// ==================== 协议矩阵：硬过滤 ====================
 
-// TestEveryProtocolCombinationIsRoutable 固定矩阵全开后的选路语义：
-// 任意入口协议都能落到任意渠道协议上（转换由 converter 负责），
-// 因此候选就是全部健康渠道，顺序**只**由 priority 决定。
-func TestEveryProtocolCombinationIsRoutable(t *testing.T) {
+func TestChatInputOnlyRoutesToChatChannel(t *testing.T) {
 	cfg := testConfig([]config.ChannelConfig{
 		testChannel("A-anthropic", config.ProviderAnthropic, 1),
 		testChannel("B-responses", config.ProviderOpenAIResponses, 2),
 		testChannel("C-chat", config.ProviderOpenAI, 3),
 	}, 10)
-
-	want := []string{"A-anthropic", "B-responses", "C-chat"}
-	for _, in := range []converter.ApiFormat{converter.FormatOpenAIChat, converter.FormatAnthropic, converter.FormatResponses} {
-		assertEqual(t, selected(t, cfg, in), want, in.String()+" 入口")
-	}
+	assertEqual(t, selected(t, cfg, converter.FormatOpenAIChat), []string{"C-chat"}, "chat 入口")
 }
 
-// TestNoHealthyChannelIsTheOnlyRoutingFailure 固定失败语义：
-// 矩阵全开之后，「有健康渠道却一个都用不上」不再可能，
-// 唯一的路由失败原因是没有任何启用且健康的渠道。
-func TestNoHealthyChannelIsTheOnlyRoutingFailure(t *testing.T) {
-	// 有渠道但全部禁用 → 没有可用渠道。
-	disabled := testChannel("A-anthropic", config.ProviderAnthropic, 1)
-	disabled.Enabled = false
-	cfg := testConfig([]config.ChannelConfig{disabled}, 10)
+func TestMessagesInputRoutesToMessagesOrChat(t *testing.T) {
+	cfg := testConfig([]config.ChannelConfig{
+		testChannel("A-anthropic", config.ProviderAnthropic, 1),
+		testChannel("B-responses", config.ProviderOpenAIResponses, 2),
+		testChannel("C-chat", config.ProviderOpenAI, 3),
+	}, 10)
+	assertEqual(t, selected(t, cfg, converter.FormatAnthropic),
+		[]string{"A-anthropic", "C-chat"}, "messages 入口")
+}
+
+func TestResponsesInputRoutesToResponsesOrChat(t *testing.T) {
+	cfg := testConfig([]config.ChannelConfig{
+		testChannel("A-anthropic", config.ProviderAnthropic, 1),
+		testChannel("B-responses", config.ProviderOpenAIResponses, 2),
+		testChannel("C-chat", config.ProviderOpenAI, 3),
+	}, 10)
+	assertEqual(t, selected(t, cfg, converter.FormatResponses),
+		[]string{"B-responses", "C-chat"}, "responses 入口")
+}
+
+func TestUnsupportedProtocolIsReportedDistinctly(t *testing.T) {
+	cfg := testConfig([]config.ChannelConfig{
+		testChannel("A-anthropic", config.ProviderAnthropic, 1),
+		testChannel("B-responses", config.ProviderOpenAIResponses, 2),
+	}, 10)
 	re := routeError(t, cfg, converter.FormatOpenAIChat)
-	if re.Kind != RouteNoAvailableChannel {
-		t.Fatalf("期望 NoAvailableChannel，得到 %+v", re)
+	if re.Kind != RouteUnsupportedProtocol || re.Input != converter.FormatOpenAIChat {
+		t.Fatalf("期望 UnsupportedProtocol(chat)，得到 %+v", re)
 	}
 
-	// 熔断/不健康渠道的过滤由熔断相关用例覆盖（见下方 priority 与熔断小节）：
-	// 这里只固定「协议不再是失败原因」这一条语义。
+	cfg2 := testConfig([]config.ChannelConfig{
+		testChannel("B-responses", config.ProviderOpenAIResponses, 1),
+	}, 10)
+	re2 := routeError(t, cfg2, converter.FormatAnthropic)
+	if re2.Kind != RouteUnsupportedProtocol || re2.Input != converter.FormatAnthropic {
+		t.Fatalf("期望 UnsupportedProtocol(messages)，得到 %+v", re2)
+	}
 }
 
 func TestNoAvailableChannelIsReportedDistinctly(t *testing.T) {
@@ -232,16 +247,23 @@ func TestLimitIsIndependentFromPerChannelRetryCount(t *testing.T) {
 	}
 }
 
-// ==================== 终极兜底：同样不看协议 ====================
+// ==================== 终极兜底也要守协议矩阵 ====================
 
-func TestUltimateFallbackIgnoresProtocol(t *testing.T) {
-	// 正常候选全部不可用（禁用）时，兜底渠道仍应被选中——它的协议与入口无关。
-	disabled := testChannel("A-anthropic", config.ProviderAnthropic, 1)
-	disabled.Enabled = false
-	cfg := testConfig([]config.ChannelConfig{disabled}, 10)
+func TestUltimateFallbackRespectsProtocolMatrix(t *testing.T) {
+	cfg := testConfig([]config.ChannelConfig{
+		testChannel("A-anthropic", config.ProviderAnthropic, 1),
+	}, 10)
 	cfg.UltimateFallback = &config.UltimateFallback{Channel: "A-anthropic"}
-	assertEqual(t, selected(t, cfg, converter.FormatOpenAIChat), []string{"A-anthropic"}, "兜底生效（chat 入口 → anthropic 渠道）")
-	assertEqual(t, selected(t, cfg, converter.FormatResponses), []string{"A-anthropic"}, "兜底生效（responses 入口 → anthropic 渠道）")
+	re := routeError(t, cfg, converter.FormatOpenAIChat)
+	if re.Kind != RouteUnsupportedProtocol {
+		t.Fatalf("兜底渠道也不能违逆协议矩阵，得到 %+v", re)
+	}
+
+	cfg2 := testConfig([]config.ChannelConfig{
+		testChannel("A-anthropic", config.ProviderAnthropic, 1),
+	}, 10)
+	cfg2.UltimateFallback = &config.UltimateFallback{Channel: "A-anthropic"}
+	assertEqual(t, selected(t, cfg2, converter.FormatAnthropic), []string{"A-anthropic"}, "兜底生效")
 }
 
 // ==================== 错误文案 ====================

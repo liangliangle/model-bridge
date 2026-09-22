@@ -61,17 +61,12 @@ func ExecuteOnChannel(state *app.State, ctx *RequestContext, rt Route, auditID i
 	to := FormatFromProvider(ch.Provider)
 	// 方向只在这里确定一次：下游=入口协议，上游=渠道协议。
 	// 请求方向与响应方向共用这个 Hop，因此不可能把两个方向写反。
-	hop := converter.NewHop(ctx.Format.AsClient(), to.AsChannel())
+	hop, herr := converter.NewHop(ctx.Format.AsClient(), to.AsChannel())
+	if herr != nil {
+		// 路由层已按矩阵过滤，能走到这里说明矩阵被绕过。
+		return fmt.Errorf("invalid_request: cannot convert %s request to a %s channel", ctx.Format, to)
+	}
 	convert := hop.Converts()
-
-	// 转换过程中的有损处理（丢弃字段、补默认值、规整形态）在请求结束时一次性打出：
-	// 有损可以接受，但必须能定位到是哪一跳丢的什么。没有任何损失时不打印。
-	defer func() {
-		if notes := hop.Notes(); len(notes) > 0 {
-			log.Printf("[convert] audit_id=%d path=%q client=%s channel=%s losses=%s",
-				auditID, hop.Plan(), ctx.Format, to, strings.Join(notes, "; "))
-		}
-	}()
 
 	sendBody, err := buildUpstreamBody(ctx, rt, hop)
 	if err != nil {
