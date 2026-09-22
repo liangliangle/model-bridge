@@ -19,33 +19,54 @@ so `git show <old-commit>:src-tauri/src/...` is how you consult the reference im
 
 ## Protocol Conversion Matrix
 
-**Read this before touching routing or the converter.** Conversion is deliberately limited to a
-single hop, with Chat Completions as the only hub:
+**Read this before touching routing or the converter.** Every combination is supported: a client
+speaking any of the three protocols can be served by a channel speaking any of the three, and the
+converter bridges the gap (through Chat Completions, the only hub — at most two hops).
 
 | Client (inbound) | Chat channel | Messages channel | Responses channel |
 |---|---|---|---|
-| Chat (`/v1/chat/completions`) | passthrough | no | no |
-| Messages (`/v1/messages`) | convert | passthrough | no |
-| Responses (`/v1/responses`) | convert | no | passthrough |
+| Chat (`/v1/chat/completions`) | passthrough | 1 hop | 1 hop |
+| Messages (`/v1/messages`) | 1 hop | passthrough | 2 hops (via Chat) |
+| Responses (`/v1/responses`) | 1 hop | 2 hops (via Chat) | passthrough |
 
-Rule: the channel side must either match the client protocol (byte passthrough) or be a Chat
-channel (converted). Flattening Messages/Responses *into* Chat is mechanical; inventing
-Messages/Responses semantics *out of* Chat (thinking, cache_control, the Responses item
-lifecycle) is where the bugs live, and Messages ↔ Responses would need two chained hops.
+**A path, not a yes/no.** `converter.NewPlan(client, channel)` (`internal/converter/plan.go`)
+returns the hop chain — `[client]` for passthrough, `[client, channel]` for one hop,
+`[client, chat, channel]` for two. Request and response directions are both *folded* from that
+plan (`internal/converter/direction.go` dispatches each edge), so a caller never assembles a
+direction by hand. This is deliberate: the two `ApiFormat` arguments of a direction are the same
+type and used to be swappable, which silently produced wrong-protocol bodies once.
+
+Only six primitive edges exist, and every one of the nine cells is their composition:
+
+| Role | Edges |
+|---|---|
+| Request (client → channel) | `messages→chat`, `responses→chat`, `chat→messages`, `chat→responses` |
+| Response (channel → client) | the same four in the opposite pairing (`chat→messages`, `chat→responses`, `messages→chat`, `responses→chat`) |
+| Streaming | `chat→messages`, `chat→responses`, `messages→chat`, `responses→chat` |
 
 Invariants:
 
-- `ApiFormat.CanRouteTo` (`internal/converter/converter.go`) is the **single source of truth** for
-  this matrix. Both routing and the converter consult it — never restate the rule elsewhere.
-- `SelectRoutes` (`internal/channel/failover.go`) hard-filters channels that cannot serve the
-  client protocol, **then** orders the survivors purely by `priority`. Filtering outranks priority:
-  a Chat client never uses a Messages channel, even at priority 1.
-- When no channel can serve the client protocol, the router returns `400` **before dispatch** with
-  an explanatory message. Never degrade silently, and never send a request upstream in the wrong
-  protocol.
-- `buildUpstreamBody` (`internal/proxy/executor.go`) re-checks the matrix before dispatch and
-  fails with `invalid_request:` if it is violated. Routing already filtered, so this is the
-  backstop that keeps a wrong-protocol request from ever reaching an upstream.
+- **Protocol does not influence channel choice.** `SelectRoutes` (`internal/channel/failover.go`)
+  orders candidates purely by `priority`; it no longer filters by protocol. A Messages client can
+  therefore land on a priority-1 Responses channel and pay for a two-hop conversion. Adding a
+  protocol filter back would re-introduce the old behaviour — don't, unless the matrix is being
+  narrowed on purpose.
+- The only routing failure is "no enabled, healthy channel". `RouteUnsupportedProtocol` is kept
+  (with its message and unit test) but is currently unreachable.
+- `Hop` (`internal/converter/hop.go`) is the only entry point to conversion: build one per
+  request from `client.AsClient()` + `channel.AsChannel()` and use it for both directions.
+- Streaming is **incremental**: `internal/converter/pipeline.go` chains one stage per hop, each
+  translating event by event and flushing. Do not "buffer the whole upstream response and replay
+  it" as a shortcut — that was considered and rejected (it kills the point of streaming and
+  changes first-byte semantics).
+- **Lossy is allowed; silent is not.** Fields the target protocol cannot express either fail the
+  request with `*UnsupportedFieldError` (400, naming the field and the target protocol) or are
+  dropped/rewritten with a note. Notes are collected on the session, exposed via `Hop.Notes()`,
+  and logged once per request as `[convert] … losses=…`. Tests assert `Notes()`, not log output.
+  See `README.md` → 「有损清单」 for the known losses (notably thinking signatures).
+- When the upstream returns a non-SSE JSON body for a stream request, `Hop.ReplayResponseAsSSE`
+  converts it to the client protocol and replays it as that protocol's event stream (the
+  degradation path in `streamFromUpstream`).
 
 ## Project Structure
 
@@ -59,8 +80,10 @@ Invariants:
   - `internal/converter/` — protocol conversion (largest module; see the matrix above).
     `hop.go` is the only exported entry point: build one `Hop` per request from
     `client.AsClient()` + `channel.AsChannel()`, then use it for **both** the request and the
-    response direction. It exists because the inner methods take a swappable `(source, target)`
-    `ApiFormat` pair, which is how the request direction once got inverted silently.
+    response direction. `plan.go` decides the hop chain, `direction.go` maps each single edge to
+    its implementation, and `pipeline.go` chains the streaming stages. Each direction has its own
+    file pair: `request.go`/`response.go` (rich → Chat) and `request_reverse.go`/
+    `response_reverse.go` (Chat → rich), with `stream.go`/`stream_reverse.go` for streaming.
   - `internal/proxy/` — `server.go` (routes, middleware, `/v1/models`), `router.go` (selection,
     audit, failover loop), `executor.go` (per-channel execution, streaming error detection),
     `context.go`
@@ -119,13 +142,13 @@ RAM and parallel compilation gets OOM-killed.
 
 | Package | Covers |
 |---|---|
-| `internal/converter` | request/response/stream mapping for both directions, namespace round-trip, SSE framing at every byte offset, `Hop` direction/regression |
-| `internal/channel` | protocol-matrix filtering, priority ordering, candidate cap, circuit breaker |
+| `internal/converter` | all six single-hop edges (both directions, stream and non-stream), two-hop folding, path planning, namespace round-trip, usage round-trips, SSE framing at every byte offset, `Hop` direction regression |
+| `internal/channel` | priority ordering, candidate cap, circuit breaker, "no healthy channel" as the only routing failure |
 | `internal/auth` | admin/proxy token rules and the exact 401 body |
 | `internal/config` | config save/merge (comments, unknown keys, 0600, atomic) and the exposure self-check |
 | `internal/audit` | rebuilding a readable response object from raw SSE (Anthropic / Chat / Responses) |
 | `internal/api` | every admin endpoint against a real config file and a real SQLite DB |
-| `e2e` | the real HTTP server driven by a mock upstream: non-stream and stream for all three entries, failover ordering, MCP tool filtering, audit/cost persistence |
+| `e2e` | the real HTTP server driven by a mock upstream: **the full 3×3 protocol matrix** (non-stream and stream), failover ordering, first-chunk error failover, non-SSE degradation, MCP tool filtering, audit/cost persistence |
 
 Guidelines:
 

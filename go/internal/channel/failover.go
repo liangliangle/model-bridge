@@ -24,6 +24,10 @@ const (
 	// RouteNoAvailableChannel 表示没有任何启用且健康的渠道。
 	RouteNoAvailableChannel RouteErrorKind = iota
 	// RouteUnsupportedProtocol 表示有健康渠道，但协议矩阵不允许服务该入口协议。
+	//
+	// 矩阵全开（任意协议互转）之后这一分支**不可达**：任意入口协议都能落到任意渠道协议上，
+	// 因此「有健康渠道却一个都用不上」不再可能。保留它是为了未来若重新收窄矩阵时仍有落点，
+	// 对应文案与单测也一并保留。
 	RouteUnsupportedProtocol
 )
 
@@ -53,19 +57,14 @@ func FormatForProvider(p config.ProviderType) converter.ApiFormat {
 	}
 }
 
-// IsSupported 判定「入口协议 → 渠道协议」组合是否受协议矩阵支持。
-// 与 converter.ApiFormat.CanRouteTo 共用同一事实来源（对应 Rust `FormatConverter::is_supported`）。
-func IsSupported(in converter.ApiFormat, p config.ProviderType) bool {
-	return in.CanRouteTo(FormatForProvider(p))
-}
-
 // SelectRoutes 为指定模型别名选择可用的渠道路由列表。
 //
-// 两层规则，顺序不能颠倒：
-//  1. 硬过滤：渠道必须能服务该入口协议——同协议（透传）或 Chat（转换）。
-//     不可服务的渠道直接排除，绝不允许退化成错误的协议转换。
-//  2. 优先级排序：在剩下的候选里，顺序完全由 priority 决定（数值越小越靠前），
-//     协议格式不参与排序；优先级相同时保持配置文件顺序。
+// 规则只有一层：**按 priority 排序**（数值越小越靠前），优先级相同时保持配置文件顺序。
+//
+// 协议不参与渠道决策：任意入口协议都能落到任意渠道协议上（转换路径由
+// converter.NewPlan 规划，最多经 Chat 两跳），因此这里不再按协议过滤候选。
+// 这也意味着候选池比「单跳矩阵」时期更大——优先级更高的渠道即使协议不同也会被选中，
+// 并为此付出一次（或两次）协议转换。
 //
 // 候选数量上限由 failover.max_failover_channels 控制，0 表示不限制。
 // 该上限只约束「尝试几个渠道」，与单渠道内重试次数（channel.retry_count）无关。
@@ -77,19 +76,15 @@ func SelectRoutes(
 ) ([]RouteDecision, error) {
 	limit, hasLimit := cfg.CandidateLimit()
 
-	// 健康且启用的渠道总数（不论协议），用于区分「没渠道」与「渠道协议不匹配」。
 	healthyTotal := 0
 	routes := make([]RouteDecision, 0, len(cfg.Channels))
 
-	// SortedChannels 已按 priority 升序稳定排序（且过滤 enabled），过滤后仍保持该顺序。
+	// SortedChannels 已按 priority 升序稳定排序（且过滤 enabled）。
 	for _, ch := range cfg.SortedChannels() {
 		if !health.IsAvailable(ch.ID) {
 			continue
 		}
 		healthyTotal++
-		if !IsSupported(in, ch.Provider) {
-			continue
-		}
 		actualModel, source := ch.ResolveModel(modelAlias)
 		routes = append(routes, RouteDecision{
 			Channel:       ch,
@@ -103,9 +98,9 @@ func SelectRoutes(
 		routes = routes[:limit]
 	}
 
-	// 终极兜底渠道同样要满足协议矩阵，否则会退化成已下线的转换方向。
+	// 终极兜底渠道与普通候选一样：只看是否存在，不看协议。
 	if len(routes) == 0 && cfg.UltimateFallback != nil {
-		if ch := cfg.FindChannel(cfg.UltimateFallback.Channel); ch != nil && IsSupported(in, ch.Provider) {
+		if ch := cfg.FindChannel(cfg.UltimateFallback.Channel); ch != nil {
 			actualModel, source := ch.ResolveModel(modelAlias)
 			routes = append(routes, RouteDecision{
 				Channel:       ch,
@@ -118,7 +113,9 @@ func SelectRoutes(
 	if len(routes) > 0 {
 		return routes, nil
 	}
-	// 有健康渠道却一个都用不上 → 是协议不匹配，而不是「没有渠道」。
+	// 走到这里说明一个候选都没有：矩阵全开之后，剩下的唯一可能是「没有健康的可用渠道」。
+	// RouteUnsupportedProtocol 分支保留但**当前不可达**（见该常量的注释），
+	// 仅在未来重新收窄矩阵时才可能重新触发。
 	if healthyTotal > 0 {
 		return nil, &RouteError{Kind: RouteUnsupportedProtocol, Input: in}
 	}

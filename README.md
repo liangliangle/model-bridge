@@ -28,25 +28,41 @@
 
 ## 协议转换矩阵
 
-网关以 **Chat Completions 作为唯一的转换枢纽**。渠道侧允许的协议取决于请求方的协议：
+**任意协议互转**：三种协议的请求方都可以落到三种协议的渠道上，转换以 **Chat Completions 为唯一枢纽**（最多两跳）。
 
 | 请求方（入口） | Chat 渠道 | Anthropic (Messages) 渠道 | Responses 渠道 |
 |---|---|---|---|
-| Chat（`/v1/chat/completions`） | 透传 | ✗ | ✗ |
-| Messages（`/v1/messages`） | 转换 | 透传 | ✗ |
-| Responses（`/v1/responses`） | 转换 | ✗ | 透传 |
+| Chat（`/v1/chat/completions`） | 透传 | 单跳转换 | 单跳转换 |
+| Messages（`/v1/messages`） | 单跳转换 | 透传 | 两跳（经 Chat） |
+| Responses（`/v1/responses`） | 单跳转换 | 两跳（经 Chat） | 透传 |
 
-规则一句话：**渠道侧要么与请求方同协议（字节透传），要么是 Chat 渠道（做转换）。**
+为什么经 Chat 中转：把 Messages / Responses 请求**拍平**成 Chat 是机械且安全的，反过来**从 Chat 造出**富协议语义才是易错方向；因此两个富协议之间不复刻第三套直连映射，而是把两条已验证的单跳串起来。
 
-为什么这样限定：
+由此带来三个行为，配置时需要知道：
 
-- 把 Messages / Responses 请求**拍平**成 Chat 是机械且安全的；反过来**从 Chat 造出** Messages / Responses 的完整语义（thinking、cache_control、Responses 的 item 生命周期）才是易错方向。
-- Messages ↔ Responses 需要两跳串联（中间经过 Chat），保真度差，同样不支持。
+- **协议不参与渠道决策**：候选渠道只看是否启用与健康，顺序**完全**由 `priority` 决定。优先级高的渠道即使协议与请求方不同也会被选中，并为此付出一次（或两次）协议转换。若你希望某类请求走原生协议渠道，请用 `priority` 表达。
+- 唯一的选路失败是「没有启用且健康的渠道」（`503`）。矩阵全开后不再有「渠道协议都不匹配」这种失败。
+- 流式是**真增量**：逐事件翻译并立即下发，不会为了转换而先攒完整个响应。
 
-由此带来两个行为，配置时需要知道：
+### 有损清单
 
-- **协议过滤优先于优先级**。不可服务的渠道会被直接排除——例如 Chat 请求方永远用不上你的 Claude 渠道，即使它 `priority: 1`。剩余候选之间仍严格按 `priority` 排序。
-- 没有渠道能服务该请求协议时，网关在**派发前**返回 `400` 并说明原因，不会静默降级、也不会白白消耗一次上游调用。
+转换本身是字段级映射，但有几处是协议之间**没有对应概念**的，属于已知有损。无法表达且会改变调用方语义的字段会直接返回 `400`（错误信息点名字段与目标协议）；其余会被丢弃或改写，并在日志里以 `[convert] … losses=…` 记录一次（`debug: false` 时也记录，因为这是"结果与请求不完全一致"的唯一线索）。
+
+| 场景 | 处理 | 说明 |
+|---|---|---|
+| Chat 的 `n > 1` | **400** | 目标协议每次请求只返回一条结果 |
+| Chat 的 `logprobs` / `top_logprobs` | **400** | 目标协议没有 token 级对数概率 |
+| Responses 的 `previous_response_id` / `conversation` | **400** | 会话状态无法跨协议续接 |
+| 只有 `encrypted_content`、没有可读 `summary` 的 Responses reasoning 项 | **400** | 没有可搬运的文本 |
+| assistant 历史里的 `reasoning_content` → Messages / Responses | 丢弃并记日志 | **thinking 块的 `signature` 无法伪造**（上游会校验），因此不造 thinking 块；这也意味着「经 Chat 的往返不可能无损」 |
+| Messages 的 `thinking` 块 → Chat | 只保留文本（签名丢弃） | 同上，反向 |
+| Chat 的 `seed` / `frequency_penalty` / `presence_penalty` / `logit_bias` | 丢弃并记日志 | 目标协议无对应参数 |
+| Chat 的 `stop` → Responses | 丢弃并记日志 | Responses 没有 stop sequences |
+| Anthropic 的 `top_k` / `redacted_thinking` | 丢弃并记日志 | Chat 侧无承载位置 |
+| Chat 未给 `max_tokens` → Messages | 补默认值并记日志 | Anthropic 的 `max_tokens` 必填，兜底值为 4096 |
+| 缓存写入量（`cache_creation_input_tokens`） | 跨协议时并入输入量 | 只有 Anthropic 区分"缓存写入"；**审计与计费仍按上游原始值统计**，不受影响 |
+
+注意：**审计与成本统计始终取上游原始响应**，因此上表的有损只影响「转换后回给客户端的 usage 数值」，不影响账单口径。
 
 ## 快速开始
 

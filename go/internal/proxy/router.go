@@ -108,15 +108,19 @@ func RouteRequest(state *app.State, ctx *RequestContext, w http.ResponseWriter) 
 }
 
 // routeErrorResponse 把选路错误映射为 HTTP 状态与文案。
+//
+// 矩阵全开后任意协议组合都能服务，因此这里只剩「没有可用渠道」一种原因；
+// RouteUnsupportedProtocol 分支保留但当前不可达（见 channel 包对该常量的注释）。
 func routeErrorResponse(ctx *RequestContext, err error) (int, string, string) {
 	var re *channel.RouteError
 	if errors.As(err, &re) && re.Kind == channel.RouteUnsupportedProtocol {
 		// 请求一律在派发前拒绝：不做「先发出去再失败重试」，
 		// 避免浪费一次上游调用，也让用户看到可定位的原因。
 		return http.StatusBadRequest, "invalid_request_error", fmt.Sprintf(
-			"No channel can serve the '%s' input protocol: this gateway requires %s. "+
-				"Add a matching-format channel, or a chat channel to convert into.",
-			ctx.ProtocolName(), AllowedProviderHint(ctx.Format))
+			"No channel can serve the '%s' input protocol. "+
+				"Add a channel for any of the three protocols (chat / messages / responses): "+
+				"this gateway converts between all of them.",
+			ctx.ProtocolName())
 	}
 	return http.StatusServiceUnavailable, "server_error", "No available channels"
 }

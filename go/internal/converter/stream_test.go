@@ -140,16 +140,24 @@ func joinChunks(chunks [][]byte) []byte {
 	return out
 }
 
-// runStream 通过门面跑一遍 chat 上游 → out 格式的流式转换。
+// runStream 跑一遍「chat 上游 → out 格式客户端」的流式转换（走真实流水线）。
+// 注意参数顺序：客户端协议在前、渠道协议在后（out 是客户端协议）。
 func runStream(t *testing.T, session *convSession, out ApiFormat, model string, payload string, sizes []int) ([]byte, Usage) {
+	t.Helper()
+	return runStreamFrom(t, session, out, FormatOpenAIChat, model, payload, sizes)
+}
+
+// runStreamFrom 跑一遍「channel 上游 → client 客户端」的流式转换（走真实流水线）。
+// 任意协议组合都可以，因此它同时覆盖单跳与两跳。
+func runStreamFrom(t *testing.T, session *convSession, client, channel ApiFormat, model string, payload string, sizes []int) ([]byte, Usage) {
 	t.Helper()
 	var buf bytes.Buffer
 	reader := &chunkedReader{data: []byte(payload), sizes: sizes}
-	usage, err := session.convertStreamResponse(FormatOpenAIChat, out, reader, &buf, model, nil)
-	if err != nil {
-		t.Fatalf("ConvertStreamResponse: %v", err)
+	pipeline := newStreamPipeline(NewPlan(client, channel), model, session.nsReverse)
+	if err := pipeline.run(reader, &buf, nil); err != nil {
+		t.Fatalf("StreamResponse(%v → %v): %v", channel, client, err)
 	}
-	return buf.Bytes(), usage
+	return buf.Bytes(), pipeline.usage()
 }
 
 // ==================== SSE 分帧 ====================
@@ -1059,7 +1067,7 @@ func TestFullResponseToSSEFacade(t *testing.T) {
 	// in == out：仅重放，不做转换。
 	chat := []byte(`{"id":"chatcmpl-1","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)
 	chatSession := newConvSession()
-	raw, err := chatSession.fullResponseToSSE(FormatOpenAIChat, FormatOpenAIChat, chat, "m")
+	raw, err := chatSession.fullResponseToSSE(NewPlan(FormatOpenAIChat, FormatOpenAIChat), chat, "m")
 	if err != nil {
 		t.Fatalf("FullResponseToSSE(chat→chat): %v", err)
 	}
@@ -1069,7 +1077,7 @@ func TestFullResponseToSSEFacade(t *testing.T) {
 
 	// in != out：先转换再重放为入口格式的事件流。
 	responsesSession := newConvSession()
-	raw, err = responsesSession.fullResponseToSSE(FormatOpenAIChat, FormatResponses, chat, "m")
+	raw, err = responsesSession.fullResponseToSSE(NewPlan(FormatResponses, FormatOpenAIChat), chat, "m")
 	if err != nil {
 		t.Fatalf("FullResponseToSSE(chat→responses): %v", err)
 	}
@@ -1079,7 +1087,7 @@ func TestFullResponseToSSEFacade(t *testing.T) {
 	}
 
 	messagesSession := newConvSession()
-	raw, err = messagesSession.fullResponseToSSE(FormatOpenAIChat, FormatAnthropic, chat, "m")
+	raw, err = messagesSession.fullResponseToSSE(NewPlan(FormatAnthropic, FormatOpenAIChat), chat, "m")
 	if err != nil {
 		t.Fatalf("FullResponseToSSE(chat→messages): %v", err)
 	}
@@ -1089,13 +1097,34 @@ func TestFullResponseToSSEFacade(t *testing.T) {
 		t.Fatalf("messages 重放事件 = %v, want %v", names, want)
 	}
 
-	// 矩阵外的组合必须报错。
-	if _, err := chatSession.fullResponseToSSE(FormatOpenAIChat, FormatAnthropic, []byte(`{`), "m"); err == nil {
+	if _, err := chatSession.fullResponseToSSE(NewPlan(FormatAnthropic, FormatOpenAIChat), []byte(`{`), "m"); err == nil {
 		t.Fatalf("非法 JSON 必须报错")
 	}
-	if _, err := chatSession.convertStreamResponse(FormatAnthropic, FormatResponses, strings.NewReader(""), io.Discard, "m", nil); err == nil {
-		t.Fatalf("messages → responses 必须返回 *UnsupportedConversion")
-	} else if _, ok := err.(*UnsupportedConversion); !ok {
-		t.Fatalf("错误类型 = %T, want *UnsupportedConversion", err)
+
+	// 两个富协议之间（messages 渠道 → responses 客户端）现在是**两跳**流式：
+	// Anthropic 事件流 → Chat chunk → Responses 事件流。细节见 stream_reverse_test.go。
+	anthropicStream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"up\",\"content\":[],\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	raw, usage := runStreamFrom(t, chatSession, FormatResponses, FormatAnthropic, "m", anthropicStream, []int{len(anthropicStream)})
+	names = eventNames(parseSSE(t, raw))
+	if len(names) == 0 || names[0] != "response.created" {
+		t.Fatalf("两跳流式应以 response.created 开头，实际 %v", names)
+	}
+	sawCompleted := false
+	for _, name := range names {
+		if name == "response.completed" {
+			sawCompleted = true
+		}
+	}
+	if !sawCompleted {
+		t.Fatalf("两跳流式应含 response.completed，实际 %v", names)
+	}
+	// 两跳的 usage 必须仍是**上游**真实值（中间态是合成出来的，不能当账单口径）。
+	if usage.InputTokens != 11 || usage.OutputTokens != 5 {
+		t.Fatalf("两跳 usage = %+v, want input=11 output=5", usage)
 	}
 }

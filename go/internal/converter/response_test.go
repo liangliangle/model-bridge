@@ -503,7 +503,7 @@ func TestConvertNonStreamResponseFacade(t *testing.T) {
 		"usage": {"prompt_tokens": 7, "completion_tokens": 3}
 	}`)
 
-	rawMessages, err := session.convertNonStreamResponse(FormatOpenAIChat, FormatAnthropic, body, "m")
+	rawMessages, err := session.convertNonStreamResponse(NewPlan(FormatAnthropic, FormatOpenAIChat), body, "m")
 	if err != nil {
 		t.Fatalf("ConvertNonStreamResponse(->messages): %v", err)
 	}
@@ -515,7 +515,7 @@ func TestConvertNonStreamResponseFacade(t *testing.T) {
 		t.Fatalf("messages content = %v", types)
 	}
 
-	rawResponses, err := session.convertNonStreamResponse(FormatOpenAIChat, FormatResponses, body, "m")
+	rawResponses, err := session.convertNonStreamResponse(NewPlan(FormatResponses, FormatOpenAIChat), body, "m")
 	if err != nil {
 		t.Fatalf("ConvertNonStreamResponse(->responses): %v", err)
 	}
@@ -535,10 +535,29 @@ func TestConvertNonStreamResponseFacade(t *testing.T) {
 		t.Fatalf("usage.input_tokens = %d", got)
 	}
 
-	// 矩阵外的组合必须报错。
-	if _, err := session.convertNonStreamResponse(FormatAnthropic, FormatResponses, body, "m"); err == nil {
-		t.Fatalf("messages → responses 必须返回 *UnsupportedConversion")
-	} else if _, ok := err.(*UnsupportedConversion); !ok {
-		t.Fatalf("错误类型 = %T, want *UnsupportedConversion", err)
+	// 两个富协议之间不再报错：它是一条经 Chat 的两跳路径（responses → chat → messages）。
+	// 上游是 responses 渠道，因此入参必须是 Responses 形态的响应体。
+	responsesUpstream := []byte(`{
+		"id": "resp_9",
+		"object": "response",
+		"status": "completed",
+		"model": "up",
+		"output": [{"type":"message","role":"assistant","status":"completed",
+			"content":[{"type":"output_text","text":"hi","annotations":[]}]}],
+		"usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+	}`)
+	rawTwoHop, err := session.convertNonStreamResponse(NewPlan(FormatAnthropic, FormatResponses), responsesUpstream, "m")
+	if err != nil {
+		t.Fatalf("responses → chat → messages 不应报错：%v", err)
+	}
+	twoHop := mustObject(t, string(rawTwoHop))
+	if got, _ := asString(twoHop["type"]); got != "message" {
+		t.Fatalf("两跳后应为 messages 形态，实际 type=%q", got)
+	}
+	if got := extractText(twoHop["content"]); got != "hi" {
+		t.Fatalf("两跳后正文应为 hi，实际 %q", got)
+	}
+	if got, _ := asString(twoHop["stop_reason"]); got != "end_turn" {
+		t.Fatalf("stop_reason = %q, want end_turn", got)
 	}
 }

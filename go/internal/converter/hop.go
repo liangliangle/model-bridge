@@ -40,53 +40,66 @@ func (c ChannelFormat) Format() ApiFormat { return ApiFormat(c) }
 // 生命周期与一次被代理的请求一致：代理层在选定渠道后构造，请求方向与响应方向
 // 都用同一个实例——这正是方向不会被写反的原因。
 type Hop struct {
-	client  ClientFormat
-	channel ChannelFormat
+	plan    Plan
 	session *convSession
 }
 
-// NewHop 构造一次转换。组合不满足协议矩阵（渠道既不与入口同协议、也不是 Chat）
-// 时返回 *UnsupportedConversion。
-func NewHop(client ClientFormat, channel ChannelFormat) (*Hop, error) {
-	if !client.Format().CanRouteTo(channel.Format()) {
-		return nil, &UnsupportedConversion{From: client.Format(), To: channel.Format()}
-	}
-	return &Hop{client: client, channel: channel, session: newConvSession()}, nil
+// NewHop 构造一次转换。任意协议组合都能规划出路径（见 plan.go），因此不会失败。
+func NewHop(client ClientFormat, channel ChannelFormat) *Hop {
+	return &Hop{plan: NewPlan(client.Format(), channel.Format()), session: newConvSession()}
 }
 
 // Client 返回下游（请求方）协议。
-func (h *Hop) Client() ApiFormat { return h.client.Format() }
+func (h *Hop) Client() ApiFormat { return h.plan.Client() }
 
 // Channel 返回上游（渠道）协议。
-func (h *Hop) Channel() ApiFormat { return h.channel.Format() }
+func (h *Hop) Channel() ApiFormat { return h.plan.Channel() }
+
+// Plan 返回本次请求的协议路径（供日志与测试观察实际跳数）。
+func (h *Hop) Plan() Plan { return h.plan }
+
+// Notes 返回本次转换里「有损但可用」的处理说明（丢弃的字段、补的默认值、被规整的形态）。
+//
+// 用途：有损可以接受，但必须能定位到是哪一跳丢的什么——代理层在请求结束时一次性打印。
+// 真正无法表达、会改变调用方语义的字段不走这里，而是直接返回 *UnsupportedFieldError。
+func (h *Hop) Notes() []string {
+	out := make([]string, len(h.session.notes))
+	copy(out, h.session.notes)
+	return out
+}
 
 // Converts 报告本次请求是否需要协议转换。
 // false 表示上下游同协议，代理层只替换模型名后字节透传。
-func (h *Hop) Converts() bool { return h.client.Format() != h.channel.Format() }
+func (h *Hop) Converts() bool { return h.plan.Converts() }
 
 // BuildUpstreamRequest 把下游请求体转换为上游请求体（方向：下游 → 上游）。
-// 仅支持 messages→chat 与 responses→chat；其它组合返回 *UnsupportedConversion。
 func (h *Hop) BuildUpstreamRequest(body []byte, opts RequestOptions) ([]byte, error) {
-	return h.session.buildUpstreamRequest(h.client.Format(), h.channel.Format(), body, opts)
+	return h.session.buildUpstreamRequest(h.plan, body, opts)
 }
 
 // NonStreamResponse 把上游非流式响应体转换为下游响应体（方向：上游 → 下游）。
-// 仅支持 chat→messages 与 chat→responses；其它组合返回 *UnsupportedConversion。
 func (h *Hop) NonStreamResponse(body []byte, model string) ([]byte, error) {
-	return h.session.convertNonStreamResponse(h.channel.Format(), h.client.Format(), body, model)
+	return h.session.convertNonStreamResponse(h.plan, body, model)
 }
 
 // StreamResponse 读取上游 SSE（r），写出下游 SSE（w）——方向同样是上游 → 下游。
 // flush 非 nil 时，每写出一个下游事件后调用一次。
 // 返回累计观察到的**上游** usage（Anthropic 口径，缓存命中单列，见 Usage）。
+//
+// 实现是一条按路径组装的流水线（见 pipeline.go）：单跳是一个阶段，两跳是两个阶段，
+// 逐事件翻译、真增量、不整段缓冲。
 func (h *Hop) StreamResponse(r io.Reader, w io.Writer, model string, flush func()) (Usage, error) {
-	return h.session.convertStreamResponse(h.channel.Format(), h.client.Format(), r, w, model, flush)
+	pipeline := newStreamPipeline(h.plan, model, h.session.nsReverse)
+	if err := pipeline.run(r, w, flush); err != nil {
+		return pipeline.usage(), err
+	}
+	return pipeline.usage(), nil
 }
 
 // ReplayResponseAsSSE 把上游**完整的非 SSE JSON 响应**重放成下游 SSE 事件流。
 // 代理在上游对「流式请求」返回了单个 JSON 体时使用它。
 //
-// 上下游同协议时不做转换，仅按入口格式重放（这不是协议转换，矩阵未被放宽）。
+// 上下游同协议时不做转换，仅按入口格式重放。
 func (h *Hop) ReplayResponseAsSSE(body []byte, model string) ([]byte, error) {
-	return h.session.fullResponseToSSE(h.channel.Format(), h.client.Format(), body, model)
+	return h.session.fullResponseToSSE(h.plan, body, model)
 }

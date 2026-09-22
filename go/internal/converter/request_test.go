@@ -888,7 +888,7 @@ func TestImageGate(t *testing.T) {
 	}
 
 	t.Run("SupportsImages=false 时报错", func(t *testing.T) {
-		_, err := finalizeChatRequest(chatBody(), RequestOptions{SupportsImages: false})
+		err := finalizeChatBody(chatBody(), RequestOptions{SupportsImages: false})
 		if err == nil {
 			t.Fatalf("应返回错误")
 		}
@@ -898,11 +898,12 @@ func TestImageGate(t *testing.T) {
 	})
 
 	t.Run("SupportsImages=true 时去掉 detail", func(t *testing.T) {
-		out, err := finalizeChatRequest(chatBody(), RequestOptions{SupportsImages: true})
-		if err != nil {
+		body := chatBody()
+		if err := finalizeChatBody(body, RequestOptions{SupportsImages: true}); err != nil {
 			t.Fatalf("不应报错：%v", err)
 		}
-		if strings.Contains(string(out), "detail") {
+		out := jsonString(body)
+		if strings.Contains(out, "detail") {
 			t.Fatalf("detail 未被剥离：%s", out)
 		}
 	})
@@ -925,10 +926,11 @@ func TestImageGate(t *testing.T) {
 		body := []byte(`{"model":"m","max_tokens":8,"messages":[{"role":"user","content":[
 			{"type":"image","source":{"type":"url","url":"http://img"}}]}]}`)
 		session := newConvSession()
-		if _, err := session.buildUpstreamRequest(FormatAnthropic, FormatOpenAIChat, body, RequestOptions{SupportsImages: false}); err == nil {
+		plan := NewPlan(FormatAnthropic, FormatOpenAIChat)
+		if _, err := session.buildUpstreamRequest(plan, body, RequestOptions{SupportsImages: false}); err == nil {
 			t.Fatalf("应返回不支持图片的错误")
 		}
-		if _, err := session.buildUpstreamRequest(FormatAnthropic, FormatOpenAIChat, body, RequestOptions{SupportsImages: true}); err != nil {
+		if _, err := session.buildUpstreamRequest(plan, body, RequestOptions{SupportsImages: true}); err != nil {
 			t.Fatalf("支持图片时不应报错：%v", err)
 		}
 	})

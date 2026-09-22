@@ -1,12 +1,13 @@
-// Package converter 实现三套协议的**单跳**转换，以 OpenAI Chat Completions 为唯一中枢：
+// Package converter 实现三套协议的互转：任意入口协议 → 任意渠道协议。
 //
-//	请求方向：messages → chat、responses → chat
-//	响应方向：chat → messages、chat → responses
+// 转换以 OpenAI Chat Completions 为唯一中枢（见 plan.go::Hub）：
 //
-// 同协议之间是字节透传，由代理层负责，不在本包范围内（与 Rust
-// src-tauri/src/converter/mod.rs 的协议矩阵一致）。矩阵的唯一事实来源是
-// ApiFormat.CanRouteTo（对应 Rust `ApiFormat::can_route_to`）：渠道侧要么与请求方
-// 同协议（透传），要么是 Chat（本包转换）。
+//	同协议       ：字节透传，由代理层负责，不在本包范围内
+//	其一为 Chat  ：单跳（请求方向 4 条边 + 响应方向 4 条边，见 direction.go）
+//	两个富协议   ：两跳，经 Chat 串联（例如 messages → chat → responses）
+//
+// 一条路径由 NewPlan 规划，请求方向与响应方向都从它折叠得出，调用点不再自己拼装方向
+// （历史上方向写反过一次，见 hop.go 顶部）。矩阵不再是「能不能」的判定，而是「走哪条路」。
 //
 // 实现由两处合并而来（每个函数上方都标注了对应实现，便于逐一对照）：
 //
@@ -29,10 +30,8 @@
 package converter
 
 import (
-	"io"
+	"fmt"
 	"strings"
-
-	"modelbridge/internal/sse"
 )
 
 // ApiFormat 是三套协议的统一格式标识（对应 Rust converter/mod.rs::ApiFormat）。
@@ -76,13 +75,6 @@ func ParseApiFormat(s string) (ApiFormat, bool) {
 	}
 }
 
-// CanRouteTo 判定该入口格式能否路由到目标渠道格式——协议转换矩阵的唯一事实来源
-// （对应 Rust `ApiFormat::can_route_to`）。规则一句话：目标侧要么与入口同协议
-// （字节透传），要么是 Chat（做转换）。
-func (f ApiFormat) CanRouteTo(to ApiFormat) bool {
-	return f == to || to == FormatOpenAIChat
-}
-
 // UnsupportedConversion 表示协议矩阵不支持的「入口协议 → 渠道协议」组合。
 // 对应 Rust converter/mod.rs::UnsupportedConversion。
 type UnsupportedConversion struct {
@@ -92,6 +84,22 @@ type UnsupportedConversion struct {
 
 func (e *UnsupportedConversion) Error() string {
 	return "unsupported protocol conversion " + e.From.String() + " -> " + e.To.String()
+}
+
+// UnsupportedFieldError 表示入口请求里的某个字段在目标协议里**无法表达**。
+//
+// 与「有损但可用」（记 note 后照常转换）的区别：这里丢弃会改变调用方依赖的语义，
+// 例如 Chat 的 n>1 在 Anthropic 上只能得到一条 choice。静默丢会让调用方拿到形状不对的
+// 结果，因此直接拒绝，并把字段名与目标协议写进错误信息（代理层会转成 400
+// invalid_request，调用方据此能定位到具体字段）。
+type UnsupportedFieldError struct {
+	Field  string
+	Target ApiFormat
+	Reason string
+}
+
+func (e *UnsupportedFieldError) Error() string {
+	return fmt.Sprintf("field %q cannot be honored by a %s channel: %s", e.Field, e.Target, e.Reason)
 }
 
 // Usage 是一次请求的 token 用量。
@@ -129,6 +137,27 @@ type convSession struct {
 	// nsReverse: flat_name → (namespace_name, subtool_name)。
 	// custom 工具的 namespace 位置存放 CUSTOM_TOOL_NAMESPACE_MARKER。
 	nsReverse map[string]nsEntry
+
+	// notes 记录本次转换里「有损但可用」的处理：被丢弃的字段、被替代的默认值、
+	// 被规整的形态等。由 Hop.Notes() 暴露给代理层打日志——有损可以接受，
+	// 但必须能定位到是哪一跳、哪个字段（见 plan 的「有损清单」）。
+	notes []string
+}
+
+// note 记录一条有损处理说明（自动去重，避免逐条消息刷屏）。
+func (s *convSession) note(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	for _, existing := range s.notes {
+		if existing == msg {
+			return
+		}
+	}
+	s.notes = append(s.notes, msg)
+}
+
+// noteEdge 记录一条带方向的有损处理说明，便于在日志里直接看出是哪一跳丢的什么。
+func (s *convSession) noteEdge(from, to ApiFormat, format string, args ...any) {
+	s.note("[%s→%s] %s", from, to, fmt.Sprintf(format, args...))
 }
 
 // newConvSession 创建一个空的转换会话状态。
@@ -136,114 +165,57 @@ func newConvSession() *convSession {
 	return &convSession{nsReverse: map[string]nsEntry{}}
 }
 
-// buildUpstreamRequest 把下游请求体（in 格式）转换为上游请求体（out 格式）。
-// 仅支持 messages->chat 与 responses->chat；其它组合返回 *UnsupportedConversion。
-func (s *convSession) buildUpstreamRequest(in, out ApiFormat, body []byte, opts RequestOptions) ([]byte, error) {
-	if out != FormatOpenAIChat || (in != FormatAnthropic && in != FormatResponses) {
-		return nil, &UnsupportedConversion{From: in, To: out}
-	}
-	reqObj, err := decodeObject(body)
-	if err != nil {
-		return nil, err
-	}
-	var converted map[string]any
-	if in == FormatAnthropic {
-		converted, err = convertRequest(reqObj, opts)
-	} else {
-		converted, err = s.responsesToChat(reqObj, opts)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return finalizeChatRequest(converted, opts)
-}
-
-// convertNonStreamResponse 把上游非流式响应体（in 格式）转换为下游响应体（out 格式）。
-// 仅支持 chat->messages 与 chat->responses；其它组合返回 *UnsupportedConversion。
-func (s *convSession) convertNonStreamResponse(in, out ApiFormat, body []byte, model string) ([]byte, error) {
-	if in != FormatOpenAIChat || (out != FormatAnthropic && out != FormatResponses) {
-		return nil, &UnsupportedConversion{From: in, To: out}
-	}
-	resp, err := decodeObject(body)
-	if err != nil {
-		return nil, err
-	}
-	var converted map[string]any
-	switch out {
-	case FormatAnthropic:
-		converted = openAIToAnthropicResponse(resp, model)
-	default:
-		converted = s.toResponsesWithNS(resp, model)
-	}
-	return marshalJSON(converted)
-}
-
-// convertStreamResponse 读取 in 格式的上游 SSE（r），写出 out 格式的下游 SSE（w）。
-// flush 非 nil 时，每写出一个下游事件后调用一次。
-// 返回累计观察到的**上游** usage（Anthropic 口径，缓存命中单列，见 Usage）。
+// buildUpstreamRequest 把下游请求体转换为上游请求体：按路径逐跳施加请求方向的映射
+// （见 direction.go 的 mapRequest）。
 //
-// 仅支持 chat->messages 与 chat->responses（上游永远是中枢 Chat）。
-func (s *convSession) convertStreamResponse(in, out ApiFormat, r io.Reader, w io.Writer, model string, flush func()) (Usage, error) {
-	if in != FormatOpenAIChat || (out != FormatAnthropic && out != FormatResponses) {
-		return Usage{}, &UnsupportedConversion{From: in, To: out}
-	}
-	var conv streamConverter
-	if out == FormatAnthropic {
-		conv = newChatToAnthropicStream(model)
-	} else {
-		conv = newChatToResponsesStream(model, s.nsReverse)
-	}
-	writeAll := func(chunks [][]byte) error {
-		for _, chunk := range chunks {
-			if _, err := w.Write(chunk); err != nil {
-				return err
-			}
-			if flush != nil {
-				flush()
-			}
-		}
-		return nil
-	}
-	err := sse.Scan(r, func(ev sse.Event) error {
-		return writeAll(conv.processEvent(ev))
-	})
+// 单跳与两跳走的是同一段代码——两跳只是多折叠一条边，因此不存在「两跳专用路径」。
+func (s *convSession) buildUpstreamRequest(plan Plan, body []byte, opts RequestOptions) ([]byte, error) {
+	obj, err := decodeObject(body)
 	if err != nil {
-		return conv.usage(), err
+		return nil, err
 	}
-	if err := writeAll(conv.finalize()); err != nil {
-		return conv.usage(), err
+	for _, edge := range plan.RequestEdges() {
+		obj, err = mapRequest(s, edge.From, edge.To, obj, opts)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return conv.usage(), nil
+	return marshalJSON(obj)
 }
 
-// fullResponseToSSE 把上游**完整的非 SSE JSON 响应**（in 格式）重放成下游 SSE 事件流（out 格式）。
+// convertNonStreamResponse 把上游非流式响应体转换为下游响应体：
+// 按路径**逆序**逐跳施加响应方向的映射（见 direction.go 的 mapResponse）。
+func (s *convSession) convertNonStreamResponse(plan Plan, body []byte, model string) ([]byte, error) {
+	obj, err := decodeObject(body)
+	if err != nil {
+		return nil, err
+	}
+	for _, edge := range plan.ResponseEdges() {
+		obj, err = mapResponse(s, edge.From, edge.To, obj, model)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return marshalJSON(obj)
+}
+
+// fullResponseToSSE 把上游**完整的非 SSE JSON 响应**重放成下游 SSE 事件流。
 // 代理在上游对「流式请求」返回了单个 JSON 体时使用它。
 //
-// in != out 时先走 ConvertNonStreamResponse（受同一矩阵约束）；in == out 时不做转换，
-// 仅按该入口格式重放（这不是协议转换，矩阵未被放宽）。
-func (s *convSession) fullResponseToSSE(in, out ApiFormat, body []byte, model string) ([]byte, error) {
-	resp, err := decodeObject(body)
+// 先按路径逆序折叠响应方向的映射（同协议时没有边，等价于纯重放），
+// 再按**客户端协议**重放成该协议的事件流（见 direction.go 的 replayAs）。
+func (s *convSession) fullResponseToSSE(plan Plan, body []byte, model string) ([]byte, error) {
+	obj, err := decodeObject(body)
 	if err != nil {
 		return nil, err
 	}
-	if in != out {
-		converted, err := s.convertNonStreamResponse(in, out, body, model)
-		if err != nil {
-			return nil, err
-		}
-		resp, err = decodeObject(converted)
+	for _, edge := range plan.ResponseEdges() {
+		obj, err = mapResponse(s, edge.From, edge.To, obj, model)
 		if err != nil {
 			return nil, err
 		}
 	}
-	switch out {
-	case FormatResponses:
-		return replayResponses(resp), nil
-	case FormatAnthropic:
-		return replayAnthropic(resp), nil
-	default:
-		return replayChat(resp), nil
-	}
+	return replayAs(obj, plan.Client()), nil
 }
 
 // EnsureChatStreamUsage 在「流式」的 Chat 请求体上注入 stream_options.include_usage=true。
@@ -298,17 +270,19 @@ func InjectAnthropicCacheBreakpoints(body []byte) ([]byte, error) {
 	return out, nil
 }
 
-// finalizeChatRequest 收尾 Chat 请求体：图片能力门禁 + 去掉 image detail，然后序列化。
+// finalizeChatBody 收尾出站 Chat 体：图片能力门禁 + 去掉 image detail。
 // 对应 ocgo main.go::prepareChatBody 的尾部（rawChatBodyHasImages / validateImageSupport /
 // stripRawChatImageDetails），以及 proxyMessages 里的 validateImageSupport 调用。
-func finalizeChatRequest(out map[string]any, opts RequestOptions) ([]byte, error) {
+//
+// 不含序列化：路径折叠只需要改对象，序列化由折叠的最后一步统一做。
+func finalizeChatBody(out map[string]any, opts RequestOptions) error {
 	if rawChatBodyHasImages(out) {
 		if !opts.SupportsImages {
-			return nil, unsupportedImageModelError(modelOf(out))
+			return unsupportedImageModelError(modelOf(out))
 		}
 		stripRawChatImageDetails(out)
 	}
-	return marshalJSON(out)
+	return nil
 }
 
 // modelOf 取出站请求体里的 model（仅用于错误信息）。
